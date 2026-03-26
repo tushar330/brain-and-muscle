@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  muscle:
+    build: 
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      # host.docker.internal allows the container to talk to the Brain running locally on your laptop
+      - BRAIN_ADDR=host.docker.internal:8080 
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'     # Hard limit: half a CPU core
+          memory: 512M     # Hard limit: OOM killed if it breaches 512MB
+        reservations:
+          cpus: '0.10'
+          memory: 128M
