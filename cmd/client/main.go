@@ -3,9 +3,9 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"log"
 	"net"
-	"os"
 	"time"
 
 	"github.com/akashtripathi12/brain-and-muscle/internal/protocol"
@@ -13,60 +13,77 @@ import (
 )
 
 func main() {
-	brainAddr := os.Getenv("BRAIN_ADDR")
-	if brainAddr == "" {
-		brainAddr = "localhost:8080"
-	}
-
-	conn, err := net.Dial("tcp", brainAddr)
+	// 1. Connect to the Brain
+	conn, err := net.Dial("tcp", "localhost:8080")
 	if err != nil {
-		log.Fatalf("failed to connect to brain at %s: %v", brainAddr, err)
+		log.Fatalf("Failed to connect to Brain: %v", err)
 	}
 	defer conn.Close()
 
-	// The User's base payload
-	baseCommand := protocol.Payload{
-		Command: "process_video",
-	}
-	rawCommand, err := json.Marshal(baseCommand)
-	if err != nil {
-		log.Fatalf("failed to marshal base command: %v", err)
-	}
+	log.Println("Connected to Brain. Preparing SCATTER job...")
 
-	// The Submission Envelope
+	// 2. The User Payload (What the Muscle worker actually executes)
+	// We pass dummy args here to simulate work.
+	userPayload := map[string]interface{}{
+		"command": "process_data",
+		"args":    []string{"chunk_data"},
+	}
+	userPayloadBytes, _ := json.Marshal(userPayload)
+
+	// 3. The SubmitTask Envelope
 	submitReq := protocol.SubmitTaskPayload{
 		QueueName:   "default",
+		Payload:     string(userPayloadBytes),
 		RequiredCPU: 1,
-		RequiredRAM: 512,
+		RequiredRAM: 64,
 		JobType:     "SCATTER",
-		TotalMAPs:   5,
-		Payload:     string(rawCommand),
+		TotalMAPs:   10, // 100 Chunks! Plenty of time to crash the Brain.
 	}
+	submitReqBytes, _ := json.Marshal(submitReq)
 
-	rawPayload, err := json.Marshal(submitReq)
-	if err != nil {
-		log.Fatalf("failed to marshal submit request: %v", err)
-	}
-
+	// 4. The Network Message
 	msg := protocol.Message{
-		OpCode:    protocol.OpSubmitTask,
-		NodeID:    "client-1",
-		RequestID: uuid.New().String(), // full UUID — avoids the 8-char collision risk
-		Payload:   rawPayload,
+		RequestID: uuid.New().String(),
 		Timestamp: time.Now(),
+		Payload:   submitReqBytes,
+	}
+	msgBytes, _ := json.Marshal(msg)
+
+	// 5. The 5-Byte Binary Frame (Method A Architecture)
+	header := make([]byte, 5)
+	binary.BigEndian.PutUint32(header[0:4], uint32(len(msgBytes)))
+	header[4] = protocol.OpSubmitTask // The all-important OpCode
+
+	frame := append(header, msgBytes...)
+
+	log.Println("Submitting SCATTER job (100 MAP chunks)...")
+	if _, err = conn.Write(frame); err != nil {
+		log.Fatalf("Failed to write to connection: %v", err)
 	}
 
-	body, err := json.Marshal(msg)
-	if err != nil {
-		log.Fatalf("failed to marshal message: %v", err)
+	// 6. Wait for the WAL to flush and the Brain to ACK
+	respHeader := make([]byte, 5)
+	if _, err := io.ReadFull(conn, respHeader); err != nil {
+		log.Fatalf("Failed to read Brain response: %v", err)
 	}
 
-	header := make([]byte, 4)
-	binary.BigEndian.PutUint32(header, uint32(len(body)))
+	respLen := binary.BigEndian.Uint32(respHeader[0:4])
+	respOp := respHeader[4]
 
-	if _, err := conn.Write(append(header, body...)); err != nil {
-		log.Fatalf("failed to send message to brain: %v", err)
+	respBody := make([]byte, respLen)
+	if _, err := io.ReadFull(conn, respBody); err != nil {
+		log.Fatalf("Failed to read Brain payload: %v", err)
 	}
 
-	log.Printf("[client] submitted SCATTER job (5 MAPs) to %s", brainAddr)
+	if respOp == protocol.OpTaskAccepted {
+		var ack protocol.Message
+		json.Unmarshal(respBody, &ack)
+		var accepted protocol.TaskAcceptedPayload
+		json.Unmarshal(ack.Payload, &accepted)
+
+		log.Printf("✅ SUCCESS! Brain accepted Job ID: %s", accepted.TaskID)
+		log.Println("🔥 NOW HURRY! GO TO TERMINAL 1 AND PRESS CTRL+C TO CRASH THE BRAIN! 🔥")
+	} else {
+		log.Printf("❌ Unexpected response OpCode: 0x%X", respOp)
+	}
 }

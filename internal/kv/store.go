@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"sync"
 	"time"
+
+	"github.com/akashtripathi12/brain-and-muscle/internal/protocol"
+	"github.com/akashtripathi12/brain-and-muscle/internal/wal"
 )
 
 type TaskStatus int
@@ -26,7 +28,7 @@ const (
 
 type Task struct {
 	ID               string
-	JobID            string // empty for Version A standalone tasks
+	JobID            string
 	QueueName        string
 	Payload          string
 	Result           string
@@ -51,31 +53,20 @@ type Worker struct {
 }
 
 type JobMeta struct {
-	mu          sync.Mutex // guards PendingMAPs, FailedMAPs, Status — not the map itself
 	JobID       string
 	TotalMAPs   int
 	PendingMAPs int
 	FailedMAPs  int
 	GatherTask  *Task
 	Status      JobStatus
-	ResultURIs  map[int]string // chunkIndex → result URI, built as MAPs complete
+	ResultURIs  map[int]string
 }
 
 type KVStore struct {
 	tasks   map[string]*Task
-	tasksMu sync.RWMutex
-
-	workers   map[string]*Worker
-	workersMu sync.RWMutex
-
-	// queues holds task IDs in FIFO order (oldest first).
-	queues   map[string][]string
-	queuesMu sync.Mutex
-
-	// jobs tracks in-flight SCATTER jobs.
-	// jobsMu guards the map; per-job state is guarded by JobMeta.mu.
-	jobs   map[string]*JobMeta
-	jobsMu sync.RWMutex
+	workers map[string]*Worker
+	queues  map[string][]string
+	jobs    map[string]*JobMeta
 }
 
 func NewKVStore() *KVStore {
@@ -87,100 +78,144 @@ func NewKVStore() *KVStore {
 	}
 }
 
-// Task operations
+// Replay engine
 
-// SetTask stores a task and enqueues it if StatusPending.
+// ApplyReplayEvent is the deterministic replay engine.
+// It routes each WAL entry to the same store method that originally produced it.
+// Called only during Phase 1 boot — never during live operation.
+func (kv *KVStore) ApplyReplayEvent(entry wal.LogEntry) {
+	switch entry.Event {
+
+	case wal.EventTaskQueued:
+		var task Task
+		json.Unmarshal(entry.Payload, &task)
+		kv.SetTask(&task)
+
+	case wal.EventTaskDispatched:
+		// During live operation, PopBestFitTask removes the task from
+		// the queue BEFORE TransitionTaskState marks it Running. Replay skips
+		// PopBestFitTask, so the task stays in kv.queues as a ghost entry forever.
+		// We must explicitly dequeue here to match the live code path.
+		if task, ok := kv.tasks[entry.TaskID]; ok {
+			kv.removeFromQueue(task.QueueName, entry.TaskID)
+		}
+		kv.TransitionTaskState(entry.TaskID, StatusPending, StatusRunning, entry.WorkerID)
+
+	case wal.EventTaskReverted:
+		kv.TransitionTaskState(entry.TaskID, StatusRunning, StatusPending, "")
+
+	case wal.EventTaskCompleted:
+		var envelope protocol.SubmitResultPayload
+		json.Unmarshal(entry.Payload, &envelope)
+		kv.CompleteTask(entry.TaskID, envelope.ResultPayload)
+
+	case wal.EventTaskFailed:
+		kv.HandleMAPFailure(entry.TaskID, entry.WorkerID)
+
+	case wal.EventJobRegistered:
+		// Replay restores the whole SCATTER job (job meta + all MAP tasks) from a
+		// single WAL record, so there is no partial-replay window.
+		var payload protocol.JobRegisteredPayload
+		json.Unmarshal(entry.Payload, &payload)
+		var gatherTask Task
+		json.Unmarshal(payload.GatherTask, &gatherTask)
+		kv.RegisterJob(entry.JobID, payload.TotalMAPs, &gatherTask)
+		for _, raw := range payload.MapTasks {
+			var mapTask Task
+			json.Unmarshal(raw, &mapTask)
+			// SetTask handles queue insertion only for StatusPending tasks.
+			kv.SetTask(&mapTask)
+		}
+
+	case wal.EventMAPCompleted:
+		var payload protocol.MapCompletedPayload
+		json.Unmarshal(entry.Payload, &payload)
+		kv.RecordMAPComplete(entry.JobID, payload.ChunkIndex, payload.ResultURI)
+
+	case wal.EventMAPFailed:
+		kv.RecordMAPFailed(entry.JobID)
+	}
+}
+
+// ─── Task operations ─────────────────────────────────────────────────────────
+
 func (kv *KVStore) SetTask(task *Task) {
-	kv.tasksMu.Lock()
 	kv.tasks[task.ID] = task
-	kv.tasksMu.Unlock()
-
 	if task.Status == StatusPending {
 		kv.enqueueTask(task)
 	}
 }
 
-// PopBestFitTask finds the largest pending task fitting within availCPU/RAM.
-// Locking order: queuesMu → tasksMu.RLock → queuesMu (commit) → tasksMu.RLock (verify).
-// Queue removal is the exclusive assignment gate — no double-assignment is possible.
+// PopBestFitTask selects the highest-scoring pending task whose resource
+// requirements fit within availCPU / availRAM.
 func (kv *KVStore) PopBestFitTask(queueName string, availCPU, availRAM int) (Task, bool) {
-	// Step 1 — snapshot the queue.
-	kv.queuesMu.Lock()
 	ids := kv.queues[queueName]
 	if len(ids) == 0 {
-		kv.queuesMu.Unlock()
 		return Task{}, false
 	}
-	snapshot := make([]string, len(ids))
-	copy(snapshot, ids)
-	kv.queuesMu.Unlock()
 
-	// Step 2 — scan for best-fit candidate (read-only).
-	kv.tasksMu.RLock()
-	bestIdx := -1
-	bestScore := -1
-	for i, id := range snapshot {
+	// Guard: prevent division-by-zero in the normalised scoring below.
+	if availCPU <= 0 {
+		availCPU = 1
+	}
+	if availRAM <= 0 {
+		availRAM = 1
+	}
+
+	// Single-pass: build a clean queue (no stale IDs) and pick the best task.
+	bestID := ""
+	bestScore := -1.0
+	cleanIDs := make([]string, 0, len(ids))
+
+	for _, id := range ids {
 		t, ok := kv.tasks[id]
 		if !ok || t.Status != StatusPending {
+			// stale ID — exclude from rebuilt queue so it is evicted.
 			continue
 		}
-		cpu, ram := t.RequiredCPU, t.RequiredRAM
+		cleanIDs = append(cleanIDs, id)
+
+		cpu := t.RequiredCPU
 		if cpu <= 0 {
 			cpu = 1
 		}
+		ram := t.RequiredRAM
 		if ram <= 0 {
 			ram = 1
 		}
+
 		if cpu <= availCPU && ram <= availRAM {
-			score := cpu + ram
+			// normalised score — fraction of available CPU + fraction of
+			// available RAM. Maximum possible value is 2.0 (task fills node exactly).
+			cpuScore := float64(cpu) / float64(availCPU)
+			ramScore := float64(ram) / float64(availRAM)
+			score := cpuScore + ramScore
 			if score > bestScore {
 				bestScore = score
-				bestIdx = i
+				bestID = id
 			}
 		}
 	}
-	kv.tasksMu.RUnlock()
 
-	if bestIdx == -1 {
+	// Always persist the cleaned queue, even when no task fits.
+	if bestID == "" {
+		kv.queues[queueName] = cleanIDs
 		return Task{}, false
 	}
 
-	targetID := snapshot[bestIdx]
-
-	// Step 3 — atomically remove from live queue.
-	kv.queuesMu.Lock()
-	current := kv.queues[queueName]
-	removed := false
-	for i, id := range current {
-		if id == targetID {
-			kv.queues[queueName] = append(current[:i], current[i+1:]...)
-			removed = true
-			break
+	// Rebuild final queue: cleanIDs minus the winner.
+	finalIDs := make([]string, 0, len(cleanIDs)-1)
+	for _, id := range cleanIDs {
+		if id != bestID {
+			finalIDs = append(finalIDs, id)
 		}
 	}
-	kv.queuesMu.Unlock()
+	kv.queues[queueName] = finalIDs
 
-	if !removed {
-		return Task{}, false // another worker grabbed it between steps 2 and 3
-	}
-
-	// Step 4 — return a copy.
-	kv.tasksMu.RLock()
-	t, ok := kv.tasks[targetID]
-	kv.tasksMu.RUnlock()
-
-	if !ok || t.Status != StatusPending {
-		log.Printf("[pop] task %s no longer pending after dequeue (status=%v) — discarding", targetID, t.Status)
-		return Task{}, false
-	}
-
-	return *t, true
+	return *kv.tasks[bestID], true
 }
 
-// GetTask returns a point-in-time copy of a task by ID.
 func (kv *KVStore) GetTask(id string) (Task, bool) {
-	kv.tasksMu.RLock()
-	defer kv.tasksMu.RUnlock()
 	task, ok := kv.tasks[id]
 	if !ok {
 		return Task{}, false
@@ -188,22 +223,20 @@ func (kv *KVStore) GetTask(id string) (Task, bool) {
 	return *task, true
 }
 
-// TransitionTaskState moves a task between states under tasksMu.
-// Used by the Brain to mark Running on assignment, or revert to Pending on
-// send failure. The enqueue side-effect runs outside the lock.
-//
-// Completion → CompleteTask. Failure → HandleMAPFailure.
-func (kv *KVStore) TransitionTaskState(id string, from, to TaskStatus, workerID string) error {
-	var needsEnqueue *Task
+func (kv *KVStore) GetJob(jobID string) (JobMeta, bool) {
+	job, ok := kv.jobs[jobID]
+	if !ok {
+		return JobMeta{}, false
+	}
+	return *job, true
+}
 
-	kv.tasksMu.Lock()
+func (kv *KVStore) TransitionTaskState(id string, from, to TaskStatus, workerID string) error {
 	task, ok := kv.tasks[id]
 	if !ok {
-		kv.tasksMu.Unlock()
 		return fmt.Errorf("task %s not found", id)
 	}
 	if task.Status != from {
-		kv.tasksMu.Unlock()
 		return fmt.Errorf("expected status %v, got %v", from, task.Status)
 	}
 
@@ -213,25 +246,15 @@ func (kv *KVStore) TransitionTaskState(id string, from, to TaskStatus, workerID 
 		task.AssignedWorkerID = workerID
 	case StatusPending:
 		task.AssignedWorkerID = ""
-		needsEnqueue = task
+		kv.enqueueTask(task)
 	case StatusCompleted, StatusFailed:
 		task.AssignedWorkerID = ""
 		task.CompletedAt = time.Now()
 	}
-	kv.tasksMu.Unlock()
-
-	if needsEnqueue != nil {
-		kv.enqueueTask(needsEnqueue)
-	}
 	return nil
 }
 
-// CompleteTask marks a Version A standalone task completed with its result.
-// Version B MAP completions go through RecordMAPComplete instead.
 func (kv *KVStore) CompleteTask(taskID string, result string) error {
-	kv.tasksMu.Lock()
-	defer kv.tasksMu.Unlock()
-
 	task, ok := kv.tasks[taskID]
 	if !ok {
 		return fmt.Errorf("task %s not found", taskID)
@@ -239,136 +262,132 @@ func (kv *KVStore) CompleteTask(taskID string, result string) error {
 	if task.Status != StatusRunning {
 		return fmt.Errorf("task %s is not running (status: %v)", taskID, task.Status)
 	}
-
 	task.Result = result
 	task.Status = StatusCompleted
 	task.CompletedAt = time.Now()
 	return nil
 }
 
-// HandleMAPFailure is the single failure entry point for both explicit worker
-// failures (OpTaskFailed) and silent node deaths (heartbeat watcher).
-//
-// ownerWorkerID: when non-empty, the task is only processed if this worker still
-// owns it. This closes the race window where a dead-worker requeue races with a
-// new assignment to a healthy worker.
-//
-// BUG 2 FIX: Version A standalone tasks (JobID == "") fail immediately — no retry.
-// BUG 1 FIX: Status is set to StatusPending before re-enqueuing.
 func (kv *KVStore) HandleMAPFailure(taskID, ownerWorkerID string) {
-	var needsRequeue *Task
-	var jobIDToFail string
-	var retryCount, maxRetries int
-
-	kv.tasksMu.Lock()
 	task, ok := kv.tasks[taskID]
 	if !ok {
-		kv.tasksMu.Unlock()
 		return
 	}
 
-	// Ownership check: if a specific worker is required and it's no longer the owner, skip.
 	if ownerWorkerID != "" && task.AssignedWorkerID != ownerWorkerID {
-		kv.tasksMu.Unlock()
-		log.Printf("[fail] task %s no longer owned by %s (current owner: %q) — skipping",
+		log.Printf("[fail] task %s no longer owned by %s (current: %q) — skipping",
 			taskID, ownerWorkerID, task.AssignedWorkerID)
 		return
 	}
 
-	// Version A: fail immediately, no retry.
+	// Version A standalone task: fail immediately, no retry.
 	if task.JobID == "" {
 		task.Status = StatusFailed
 		task.AssignedWorkerID = ""
 		task.CompletedAt = time.Now()
-		kv.tasksMu.Unlock()
 		log.Printf("[fail] standalone task %s failed (no retry)", taskID)
 		return
 	}
 
-	// Version B MAP task: attempt retry.
+	// Version B MAP task: retry up to MaxRetries.
 	task.RetryCount++
-	retryCount = task.RetryCount
-	maxRetries = task.MaxRetries
-
 	if task.RetryCount <= task.MaxRetries {
 		task.AttemptNumber++
-		task.Status = StatusPending // BUG 1 FIX: must be Pending before enqueue
+		task.Status = StatusPending
 		task.AssignedWorkerID = ""
-		needsRequeue = task
-	} else {
-		task.Status = StatusFailed
-		task.AssignedWorkerID = ""
-		task.CompletedAt = time.Now()
-		jobIDToFail = task.JobID
-	}
-
-	kv.tasksMu.Unlock()
-
-	if needsRequeue != nil {
-		kv.enqueueTask(needsRequeue)
-		log.Printf("[retry] task %s attempt %d/%d requeued", taskID, retryCount, maxRetries)
+		kv.enqueueTask(task)
+		log.Printf("[retry] task %s attempt %d/%d requeued", taskID, task.RetryCount, task.MaxRetries)
 		return
 	}
 
-	log.Printf("[fail] task %s exhausted %d retries", taskID, maxRetries)
-	if jobIDToFail != "" {
-		kv.RecordMAPFailed(jobIDToFail)
-	}
+	task.Status = StatusFailed
+	task.AssignedWorkerID = ""
+	task.CompletedAt = time.Now()
+	log.Printf("[fail] task %s exhausted %d retries", taskID, task.MaxRetries)
+	kv.RecordMAPFailed(task.JobID)
 }
 
-// RequeueDeadWorkerTasks routes tasks from a dead worker through HandleMAPFailure.
-// The ownership check inside HandleMAPFailure is the authoritative gate — we do NOT
-// pre-clear AssignedWorkerID here to avoid a race where a newly re-assigned task
-// is mistakenly re-processed.
-func (kv *KVStore) RequeueDeadWorkerTasks(workerID string) {
-	kv.tasksMu.RLock()
+func (kv *KVStore) RequeueDeadWorkerTasks(workerID string) []string {
 	var deadTaskIDs []string
 	for id, task := range kv.tasks {
 		if task.Status == StatusRunning && task.AssignedWorkerID == workerID {
 			deadTaskIDs = append(deadTaskIDs, id)
 		}
 	}
-	kv.tasksMu.RUnlock()
-
 	for _, taskID := range deadTaskIDs {
 		kv.HandleMAPFailure(taskID, workerID)
 	}
-
 	if len(deadTaskIDs) > 0 {
 		log.Printf("[watcher] routed %d tasks from dead worker %s through failure handler",
 			len(deadTaskIDs), workerID)
 	}
+	return deadTaskIDs
 }
 
-// Internal helpers
+// SweepTerminalState safely removes tasks and jobs that have been completed or
+// failed for longer than the given TTL, preventing unbounded memory growth.
+func (kv *KVStore) SweepTerminalState(ttl time.Duration) (int, int) {
+	now := time.Now()
+	tasksFreed, jobsFreed := 0, 0
 
-// enqueueTask appends a task ID to its queue. Never holds tasksMu when called.
+	for id, job := range kv.jobs {
+		if job.Status == JobCompleted || job.Status == JobFailed {
+			if job.GatherTask != nil {
+				deadline := job.GatherTask.CompletedAt
+				if deadline.IsZero() {
+					deadline = job.GatherTask.CreatedAt
+				}
+				if !deadline.IsZero() && now.Sub(deadline) > ttl {
+					delete(kv.jobs, id)
+					jobsFreed++
+				}
+			}
+		}
+	}
+
+	for id, task := range kv.tasks {
+		if (task.Status == StatusCompleted || task.Status == StatusFailed) && !task.CompletedAt.IsZero() {
+			if now.Sub(task.CompletedAt) > ttl {
+				delete(kv.tasks, id)
+				tasksFreed++
+			}
+		}
+	}
+
+	return tasksFreed, jobsFreed
+}
+
+// removeFromQueue removes a single taskID from the named queue in O(n).
+// Used by ApplyReplayEvent (Bug 1 fix) and internally by PopBestFitTask.
+func (kv *KVStore) removeFromQueue(queueName string, taskID string) {
+	q := kv.queues[queueName]
+	for i, id := range q {
+		if id == taskID {
+			kv.queues[queueName] = append(q[:i], q[i+1:]...)
+			return
+		}
+	}
+}
+
 func (kv *KVStore) enqueueTask(task *Task) {
 	qName := task.QueueName
 	if qName == "" {
 		qName = "default"
 	}
-	kv.queuesMu.Lock()
 	kv.queues[qName] = append(kv.queues[qName], task.ID)
-	kv.queuesMu.Unlock()
 }
 
 // Job registry (Version B)
 
-// RegisterJob stores the pre-staged GATHER task and initialises the job counter.
-// The GATHER task sits in the tasks map with StatusPending but is NOT enqueued —
-// it stays invisible to workers until RecordMAPComplete enqueues it.
+// RegisterJob creates the JobMeta and pre-stages the GATHER task.
 func (kv *KVStore) RegisterJob(jobID string, totalMAPs int, gatherTask *Task) {
-	kv.tasksMu.Lock()
-	kv.tasks[gatherTask.ID] = gatherTask
-	kv.tasksMu.Unlock()
-
-	kv.jobsMu.Lock()
-	defer kv.jobsMu.Unlock()
+	// Store a canonical copy in kv.tasks.
+	taskCopy := *gatherTask
+	kv.tasks[taskCopy.ID] = &taskCopy
 
 	kv.jobs[jobID] = &JobMeta{
 		JobID:       jobID,
-		GatherTask:  gatherTask,
+		GatherTask:  kv.tasks[taskCopy.ID], // points to the canonical copy above
 		TotalMAPs:   totalMAPs,
 		PendingMAPs: totalMAPs,
 		Status:      JobRunning,
@@ -376,24 +395,12 @@ func (kv *KVStore) RegisterJob(jobID string, totalMAPs int, gatherTask *Task) {
 	}
 }
 
-// RecordMAPComplete decrements the job counter and enqueues the GATHER task
-// when all MAPs finish successfully.
-// Decrement + evaluate are atomic under job.mu (TOCTOU fix).
-// The enqueue side-effect runs outside job.mu (contention minimisation).
 func (kv *KVStore) RecordMAPComplete(jobID string, chunkIndex int, resultURI string) error {
-	kv.jobsMu.RLock()
 	job, ok := kv.jobs[jobID]
-	kv.jobsMu.RUnlock()
 	if !ok {
 		return fmt.Errorf("job %s not found", jobID)
 	}
-
-	var taskToEnqueue *Task
-
-	job.mu.Lock()
-
 	if job.Status != JobRunning {
-		job.mu.Unlock()
 		return fmt.Errorf("job %s is not running (status: %v)", jobID, job.Status)
 	}
 
@@ -412,50 +419,37 @@ func (kv *KVStore) RecordMAPComplete(jobID string, chunkIndex int, resultURI str
 				orderedURIs[i] = job.ResultURIs[i]
 			}
 
-			// Unmarshal the pre-staged GATHER payload to inject InputURIs.
 			var payloadMap map[string]interface{}
 			if err := json.Unmarshal([]byte(job.GatherTask.Payload), &payloadMap); err != nil {
-				job.mu.Unlock()
-				return fmt.Errorf("gather task payload unmarshal for job %s: %w", jobID, err)
+				return fmt.Errorf("gather payload unmarshal for job %s: %w", jobID, err)
 			}
 			payloadMap["input_uris"] = orderedURIs
 			updated, err := json.Marshal(payloadMap)
 			if err != nil {
-				job.mu.Unlock()
-				return fmt.Errorf("gather task payload marshal for job %s: %w", jobID, err)
+				return fmt.Errorf("gather payload marshal for job %s: %w", jobID, err)
 			}
-
-			// Hold tasksMu while mutating GatherTask.Payload: the same *Task pointer
-			// is stored in kv.tasks and read by concurrent workers under tasksMu.RLock.
-			kv.tasksMu.Lock()
 			job.GatherTask.Payload = string(updated)
-			kv.tasksMu.Unlock()
 
-			taskToEnqueue = job.GatherTask
+			kv.enqueueTask(job.GatherTask)
 			log.Printf("[job] %s complete — enqueuing GATHER task %s", jobID, job.GatherTask.ID)
 		}
 	}
-
-	job.mu.Unlock()
-
-	if taskToEnqueue != nil {
-		kv.enqueueTask(taskToEnqueue)
-	}
-
 	return nil
 }
 
-// RecordMAPFailed increments the failure counter and marks the job failed when the last pending MAP slot is consumed.
 func (kv *KVStore) RecordMAPFailed(jobID string) {
-	kv.jobsMu.RLock()
 	job, ok := kv.jobs[jobID]
-	kv.jobsMu.RUnlock()
 	if !ok {
 		return
 	}
 
-	job.mu.Lock()
-	defer job.mu.Unlock()
+	// Guard: if PendingMAPs is already 0, this failure came from the GATHER
+	// stage (not a MAP stage). Mark the job failed without decrementing.
+	if job.PendingMAPs <= 0 {
+		job.Status = JobFailed
+		log.Printf("[job] %s failed at GATHER stage", jobID)
+		return
+	}
 
 	job.FailedMAPs++
 	job.PendingMAPs--
@@ -468,12 +462,13 @@ func (kv *KVStore) RecordMAPFailed(jobID string) {
 
 // Queue introspection
 
+func (kv *KVStore) QueueDepth(queueName string) int {
+	return len(kv.queues[queueName])
+}
+
 // Worker registry
 
 func (kv *KVStore) RegisterWorker(id string, totalCPU, totalRAM int) {
-	kv.workersMu.Lock()
-	defer kv.workersMu.Unlock()
-
 	existing := kv.workers[id]
 	w := &Worker{
 		ID:       id,
@@ -488,10 +483,15 @@ func (kv *KVStore) RegisterWorker(id string, totalCPU, totalRAM int) {
 	kv.workers[id] = w
 }
 
-func (kv *KVStore) UpdateWorkerHeartbeat(workerID string, availCPU, availRAM int) {
-	kv.workersMu.Lock()
-	defer kv.workersMu.Unlock()
+func (kv *KVStore) GetWorker(workerID string) (Worker, bool) {
+	w, ok := kv.workers[workerID]
+	if !ok {
+		return Worker{}, false
+	}
+	return *w, true
+}
 
+func (kv *KVStore) UpdateWorkerHeartbeat(workerID string, availCPU, availRAM int) {
 	w, ok := kv.workers[workerID]
 	if !ok {
 		w = &Worker{ID: workerID}
@@ -502,11 +502,7 @@ func (kv *KVStore) UpdateWorkerHeartbeat(workerID string, availCPU, availRAM int
 	w.LastHeartbeat = time.Now()
 }
 
-
 func (kv *KVStore) GetDeadWorkers(deadline time.Duration) []string {
-	kv.workersMu.Lock()
-	defer kv.workersMu.Unlock()
-
 	var dead []string
 	cutoff := time.Now().Add(-deadline)
 	for id, w := range kv.workers {
@@ -518,7 +514,57 @@ func (kv *KVStore) GetDeadWorkers(deadline time.Duration) []string {
 }
 
 func (kv *KVStore) RemoveWorker(workerID string) {
-	kv.workersMu.Lock()
-	defer kv.workersMu.Unlock()
 	delete(kv.workers, workerID)
+}
+
+// Snapshot compaction
+
+type StateSnapShot struct {
+	Tasks  map[string]*Task    `json:"tasks"`
+	Queues map[string][]string `json:"queues"`
+	Jobs   map[string]*JobMeta `json:"jobs"`
+}
+
+func (kv *KVStore) ExportSnapshot() []byte {
+	snap := StateSnapShot{
+		Tasks:  kv.tasks,
+		Queues: kv.queues,
+		Jobs:   kv.jobs,
+	}
+	data, _ := json.Marshal(snap)
+	return data
+}
+
+func (kv *KVStore) ImportSnapshot(data []byte) error {
+	var snap StateSnapShot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return err
+	}
+
+	kv.tasks = snap.Tasks
+	kv.queues = snap.Queues
+	kv.jobs = snap.Jobs
+
+	// Re-link GatherTask pointers in JobMeta to the authoritative *Task in
+	// kv.tasks. This is necessary after JSON round-trip because json.Unmarshal
+	// allocates separate objects for the embedded GatherTask and the map entry.
+	for _, job := range kv.jobs {
+		if job.GatherTask != nil {
+			if originalTask, ok := kv.tasks[job.GatherTask.ID]; ok {
+				job.GatherTask = originalTask
+			}
+		}
+	}
+
+	for _, t := range kv.tasks {
+		if t.Status == StatusRunning && t.AssignedWorkerID != "" {
+			if _, exists := kv.workers[t.AssignedWorkerID]; !exists {
+				kv.workers[t.AssignedWorkerID] = &Worker{
+					ID:            t.AssignedWorkerID,
+					LastHeartbeat: time.Now(),
+				}
+			}
+		}
+	}
+	return nil
 }

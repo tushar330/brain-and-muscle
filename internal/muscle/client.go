@@ -16,12 +16,12 @@ import (
 )
 
 const (
-	dialTimeout      = 5 * time.Second
-	sendTimeout      = 5 * time.Second
-	maxRetries       = 10
-	baseDelay        = 500 * time.Millisecond
-	maxDelay         = 30 * time.Second
-	maxMessageBytes  = 10 * 1024 * 1024 // 10 MB — must match brain
+	dialTimeout     = 5 * time.Second
+	sendTimeout     = 5 * time.Second
+	maxRetries      = 10
+	baseDelay       = 500 * time.Millisecond
+	maxDelay        = 30 * time.Second
+	maxMessageBytes = 10 * 1024 * 1024 // 10 MB — must match brain
 )
 
 type ConnectionManager struct {
@@ -36,6 +36,8 @@ type ConnectionManager struct {
 
 	pendingMu sync.Mutex
 	pending   map[string]chan protocol.Message
+
+	onConnect func()
 }
 
 func NewConnectionManager(addr, nodeID string) *ConnectionManager {
@@ -45,6 +47,10 @@ func NewConnectionManager(addr, nodeID string) *ConnectionManager {
 		healthy: make(chan struct{}), // starts closed — not yet connected
 		pending: make(map[string]chan protocol.Message),
 	}
+}
+
+func (cm *ConnectionManager) SetOnConnect(hook func()) {
+	cm.onConnect = hook
 }
 
 // Run establishes the initial connection and silently reconnects on failure.
@@ -59,6 +65,10 @@ func (cm *ConnectionManager) Run() {
 
 		log.Printf("[connmgr] connected")
 		cm.setConn(conn)
+
+		if cm.onConnect != nil {
+			go cm.onConnect()
+		}
 
 		// readLoop blocks until the connection breaks.
 		cm.readLoop(conn)
@@ -76,13 +86,12 @@ func (cm *ConnectionManager) WaitUntilHealthy() {
 	<-ch
 }
 
-func (cm *ConnectionManager) SendRequest(opCode string, payload interface{}) (protocol.Message, error) {
+func (cm *ConnectionManager) SendRequest(opCode uint8, payload interface{}) (protocol.Message, error) {
 	cm.WaitUntilHealthy()
 
 	requestID := uuid.New().String()
 
 	msg := protocol.Message{
-		OpCode:    opCode,
 		NodeID:    cm.nodeID,
 		RequestID: requestID,
 		Timestamp: time.Now(),
@@ -101,8 +110,9 @@ func (cm *ConnectionManager) SendRequest(opCode string, payload interface{}) (pr
 		return protocol.Message{}, fmt.Errorf("marshal message: %w", err)
 	}
 
-	header := make([]byte, 4)
-	binary.BigEndian.PutUint32(header, uint32(len(body)))
+	header := make([]byte, 5)
+	binary.BigEndian.PutUint32(header[0:4], uint32(len(body)))
+	header[4] = opCode
 	frame := append(header, body...)
 
 	responseCh := make(chan protocol.Message, 1)
@@ -112,7 +122,19 @@ func (cm *ConnectionManager) SendRequest(opCode string, payload interface{}) (pr
 
 	cm.connMu.Lock()
 	conn := cm.conn
+	if conn == nil {
+		cm.connMu.Unlock()
+		cm.pendingMu.Lock()
+		delete(cm.pending, requestID)
+		cm.pendingMu.Unlock()
+		return protocol.Message{}, fmt.Errorf("connection dropped before write for opcode 0x%X", opCode)
+	}
+
 	_, writeErr := conn.Write(frame)
+	if writeErr != nil {
+		// sees nil and skips its own Close() on the same underlying connection.
+		cm.conn = nil
+	}
 	cm.connMu.Unlock()
 
 	if writeErr != nil {
@@ -120,17 +142,15 @@ func (cm *ConnectionManager) SendRequest(opCode string, payload interface{}) (pr
 		delete(cm.pending, requestID)
 		cm.pendingMu.Unlock()
 
-		conn.Close()
+		conn.Close() // close the local copy; markUnhealthy will skip it
 		return protocol.Message{}, fmt.Errorf("write failed: %w", writeErr)
 	}
 
 	select {
 	case resp, ok := <-responseCh:
 		if !ok {
-			// markUnhealthy now closes channel.
-			// This branch is the fast-fail path — returns immediately instead of
-			// waiting for the full sendTimeout.
-			return protocol.Message{}, fmt.Errorf("connection lost while waiting for %s response", opCode)
+			// markUnhealthy closed the channel — fast-fail path.
+			return protocol.Message{}, fmt.Errorf("connection lost while waiting for %d response", opCode)
 		}
 		return resp, nil
 
@@ -138,20 +158,20 @@ func (cm *ConnectionManager) SendRequest(opCode string, payload interface{}) (pr
 		cm.pendingMu.Lock()
 		delete(cm.pending, requestID)
 		cm.pendingMu.Unlock()
-		return protocol.Message{}, fmt.Errorf("request %s (%s) timed out after %v", opCode, requestID, sendTimeout)
+		return protocol.Message{}, fmt.Errorf("request %d (%s) timed out after %v", opCode, requestID, sendTimeout)
 	}
 }
 
 // readLoop is the ONLY goroutine that reads from the socket.
 func (cm *ConnectionManager) readLoop(conn net.Conn) {
 	for {
-		header := make([]byte, 4)
+		header := make([]byte, 5)
 		if _, err := io.ReadFull(conn, header); err != nil {
 			log.Printf("[readloop] header read error: %v — exiting", err)
 			return
 		}
 
-		bodyLen := binary.BigEndian.Uint32(header)
+		bodyLen := binary.BigEndian.Uint32(header[0:4])
 		if bodyLen > maxMessageBytes {
 			log.Printf("[readloop] oversized body: %d bytes — exiting", bodyLen)
 			return
@@ -169,6 +189,8 @@ func (cm *ConnectionManager) readLoop(conn net.Conn) {
 			continue
 		}
 
+		msg.OpCode = header[4]
+
 		cm.pendingMu.Lock()
 		ch, found := cm.pending[msg.RequestID]
 		if found {
@@ -179,8 +201,7 @@ func (cm *ConnectionManager) readLoop(conn net.Conn) {
 		if found {
 			ch <- msg
 		} else {
-			log.Printf("[readloop] no pending request for RequestID %q (opcode: %s)",
-				msg.RequestID, msg.OpCode)
+			log.Printf("[readloop] no pending request for RequestID %q", msg.RequestID)
 		}
 	}
 }
@@ -216,14 +237,16 @@ func (cm *ConnectionManager) markUnhealthy() {
 }
 
 func connectWithBackoff(addr string) (net.Conn, error) {
+	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		conn, err := net.DialTimeout("tcp", addr, dialTimeout)
 		if err == nil {
 			return conn, nil
 		}
+		lastErr = err
 
 		if attempt == maxRetries-1 {
-			return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, err)
+			break // no sleep on the last attempt
 		}
 
 		delay := baseDelay * (1 << attempt)
@@ -238,5 +261,5 @@ func connectWithBackoff(addr string) (net.Conn, error) {
 
 		time.Sleep(sleep)
 	}
-	return nil, fmt.Errorf("exhausted all %d retries", maxRetries)
+	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
 }

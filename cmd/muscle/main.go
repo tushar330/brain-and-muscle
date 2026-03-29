@@ -13,12 +13,8 @@ func main() {
 	brainAddr := envOrDefault("BRAIN_ADDR", "localhost:8080")
 	workerID := envOrDefault("WORKER_ID", "muscle-1")
 
-	// Read Docker-injected resource limits from the environment.
-	// When running with `docker run --cpus="2" --memory="4g"`, set:
-	//   -e TOTAL_CPU=2 -e TOTAL_RAM_MB=4096
-	// Falls back to the host's full resources when running locally.
 	totalCPU := envInt("TOTAL_CPU", runtime.NumCPU())
-	totalRAM := envInt("TOTAL_RAM_MB", 4096) // MB
+	totalRAM := envInt("TOTAL_RAM_MB", 4096)
 
 	log.Printf("muscle worker %s starting — brain at %s (%d CPU / %d MB RAM)",
 		workerID, brainAddr, totalCPU, totalRAM)
@@ -26,15 +22,20 @@ func main() {
 	cm := muscle.NewConnectionManager(brainAddr, workerID)
 	w := muscle.NewWorker(cm, totalCPU, totalRAM)
 
-	go cm.Run() // connect + reconnect loop
+	// NEW: Tell the ConnectionManager to register us EVERY TIME it connects!
+	cm.SetOnConnect(func() {
+		log.Println("[system] TCP connected. Announcing resources to Brain...")
+		w.Register()
+	})
 
-	// Wait for the first healthy connection before announcing ourselves.
-	// Register sends OpRegisterWorker so the Brain knows our hard limits.
+	// Run the connection loop (this will trigger the hook on the first connect too)
+	go cm.Run()
+
+	// Wait until the first connection is established and the hook fires
 	cm.WaitUntilHealthy()
-	w.Register()
 
-	go w.HeartbeatLoop() // sends live AvailCPU/RAM every 5s
-	w.TaskRequestLoop()  // blocks main goroutine
+	go w.HeartbeatLoop()
+	w.TaskRequestLoop()
 }
 
 func envOrDefault(key, fallback string) string {

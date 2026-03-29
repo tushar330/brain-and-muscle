@@ -429,7 +429,3 @@ func handleScatterJob(store *kv.KVStore, walEngine *wal.GroupCommitWAL, req prot
 		Payload:   protocol.TaskAcceptedPayload{TaskID: jobID},
 	})
 }
-
-func sendResponse(conn net.Conn, opCode uint8, requestID string, payload interface{}) {
-	protocol.SendResponse(conn, opCode, requestID, payload)
-}

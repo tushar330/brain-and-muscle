@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -53,8 +52,6 @@ func (p *ResourcePool) Acquire(cpu, ram int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// 'for' not 'if': when we wake up another goroutine may have taken the
-	// resources a microsecond before us, so we must re-check the condition.
 	for p.availCPU < cpu || p.availRAM < ram {
 		p.cond.Wait()
 	}
@@ -71,11 +68,10 @@ func (p *ResourcePool) Release(cpu, ram int) {
 	p.availRAM += ram
 	p.mu.Unlock()
 
-	p.cond.Broadcast() // wake EVERYONE — each will re-check the condition
+	p.cond.Broadcast()
 }
 
 // Available returns a point-in-time snapshot of free resources.
-// Used by HeartbeatLoop and TaskRequestLoop to advertise capacity to the Brain.
 func (p *ResourcePool) Available() (cpu, ram int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -94,7 +90,6 @@ const (
 	backoffDuration = 2 * time.Second
 	queueName       = "default"
 
-	// Fallback per-task cost if a task arrives with zero resource requirements.
 	defaultTaskCPU = 1
 	defaultTaskRAM = 256 // MB
 )
@@ -126,7 +121,7 @@ func (w *Worker) Register() {
 		return
 	}
 	if resp.OpCode != protocol.OpWorkerRegistered {
-		log.Printf("[register] unexpected ack: %s", resp.OpCode)
+		log.Printf("[register] unexpected ack: %d", resp.OpCode)
 		return
 	}
 	log.Printf("[register] registered with Brain — %d CPU / %d MB RAM", totalCPU, totalRAM)
@@ -150,17 +145,17 @@ func (w *Worker) HeartbeatLoop() {
 			continue
 		}
 		if resp.OpCode != protocol.OpHeartbeatAck {
-			log.Printf("[heartbeat] unexpected response: %s", resp.OpCode)
+			log.Printf("[heartbeat] unexpected response: %d", resp.OpCode)
 		}
 	}
 }
 
-// TaskRequestLoop polls the Brain for work, advertising current free resources so the Brain's best-fit scheduler can match tasks to this node's headroom.
+// TaskRequestLoop polls the Brain for work, advertising current free resources
+// so the Brain's best-fit scheduler can match tasks to this node's headroom.
 func (w *Worker) TaskRequestLoop() {
 	for {
 		w.cm.WaitUntilHealthy()
 
-		// Tell the Brain exactly how much headroom we have right now.
 		availCPU, availRAM := w.semaphore.Available()
 
 		resp, err := w.cm.SendRequest(protocol.OpRequestTask, protocol.RequestTaskPayload{
@@ -202,7 +197,7 @@ func (w *Worker) TaskRequestLoop() {
 			go w.runTask(task, cpu, ram)
 
 		default:
-			log.Printf("[task] unexpected opcode: %s", resp.OpCode)
+			log.Printf("[task] unexpected opcode: %d", resp.OpCode)
 		}
 	}
 }
@@ -231,10 +226,13 @@ func (w *Worker) runTask(task protocol.AssignedTask, cpu, ram int) {
 
 	result := executeAssignedTask(task)
 
+	// An empty TaskID signals that execution failed (unmarshal error, unknown
+	// job_type, or a command that exited non-zero). Send OpTaskFailed so the
+	// Brain can retry or mark the task failed rather than recording it as done.
 	if result.TaskID == "" {
 		w.cm.SendRequest(protocol.OpTaskFailed, protocol.TaskFailedPayload{
 			TaskID: task.ID,
-			Reason: "unknown job_type",
+			Reason: "execution failed — see worker logs for details",
 		})
 		return
 	}
@@ -254,7 +252,7 @@ func (w *Worker) runTask(task protocol.AssignedTask, cpu, ram int) {
 		return
 	}
 	if resp.OpCode != protocol.OpTaskCompleted {
-		log.Printf("[exec] unexpected ack for task %s: %s", task.ID, resp.OpCode)
+		log.Printf("[exec] unexpected ack for task %s: %d", task.ID, resp.OpCode)
 		return
 	}
 
@@ -267,7 +265,7 @@ func executeAssignedTask(assigned protocol.AssignedTask) protocol.TaskCompletePa
 
 	if err := json.Unmarshal([]byte(assigned.Payload), &payload); err != nil {
 		log.Printf("[exec] failed to unmarshal payload for task %s: %v", assigned.ID, err)
-		return protocol.TaskCompletePayload{}
+		return protocol.TaskCompletePayload{} // empty TaskID → failure path in runTask
 	}
 
 	switch payload.JobType {
@@ -279,11 +277,12 @@ func executeAssignedTask(assigned protocol.AssignedTask) protocol.TaskCompletePa
 		return executeStandardTask(assigned.ID, payload)
 	default:
 		log.Printf("[exec] unknown job_type=%q for task %s — reporting failure", payload.JobType, assigned.ID)
-		return protocol.TaskCompletePayload{TaskID: assigned.ID}
+		return protocol.TaskCompletePayload{} // empty TaskID → failure path in runTask
 	}
 }
 
-// executeMAPTask runs a single fan-out chunk and returns a deterministic, attempt-scoped Claim Check URI so the Brain can distinguish retries.
+// executeMAPTask runs a single fan-out chunk and returns a deterministic,
+// attempt-scoped Claim Check URI so the Brain can distinguish retries.
 func executeMAPTask(taskID string, p protocol.Payload) protocol.TaskCompletePayload {
 	log.Printf("[map] task=%s job=%s chunk=%d attempt=%d",
 		taskID, p.JobID, p.ChunkIndex, p.AttemptNumber)
@@ -304,13 +303,12 @@ func executeMAPTask(taskID string, p protocol.Payload) protocol.TaskCompletePayl
 }
 
 // executeGatherTask sits behind the scatter/gather barrier.
-// It receives the set of MAP output URIs (Claim Checks) injected by the Brain and merges them into a single final result.
+// It receives the set of MAP output URIs (Claim Checks) injected by the Brain
+// and merges them into a single final result.
 func executeGatherTask(taskID string, p protocol.Payload) protocol.TaskCompletePayload {
 	log.Printf("[gather] task=%s job=%s merging %d inputs",
 		taskID, p.JobID, len(p.InputURIs))
 
-	// In production: download each URI from Supabase storage and merge locally.
-	// For now, log each URI to prove the data plane wiring is correct.
 	for i, uri := range p.InputURIs {
 		log.Printf("[gather] task=%s input[%d] = %s", taskID, i, uri)
 		// TODO: download uri → local tmp file
@@ -329,27 +327,26 @@ func executeGatherTask(taskID string, p protocol.Payload) protocol.TaskCompleteP
 }
 
 // executeStandardTask handles legacy Version A tasks.
-// It runs the ExecPayload command via os/exec and returns captured stdout.
 func executeStandardTask(taskID string, p protocol.Payload) protocol.TaskCompletePayload {
-	log.Printf("[standard] task=%s command=%q", taskID, p.Command)
+	log.Printf("[standard] task=%s command=%q args=%v", taskID, p.Command, p.Args)
 
-	parts := strings.Fields(p.Command)
-	if len(parts) == 0 {
+	if p.Command == "" {
 		log.Printf("[standard] task=%s empty command", taskID)
-		return protocol.TaskCompletePayload{TaskID: taskID}
+		return protocol.TaskCompletePayload{} // FIX Bug 2: empty → failure path
 	}
 
-	cmd := exec.Command(parts[0], parts[1:]...) //nolint:gosec
+	cmd := exec.Command(p.Command, p.Args...) //nolint:gosec
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		// return empty payload so runTask sends OpTaskFailed to the Brain.
 		log.Printf("[standard] task=%s failed: %v | stderr: %s", taskID, err, stderr.String())
-		return protocol.TaskCompletePayload{TaskID: taskID, ResultURI: stderr.String()}
+		return protocol.TaskCompletePayload{}
 	}
 
-	result := strings.TrimSpace(stdout.String())
+	result := stdout.String()
 	log.Printf("[standard] task=%s done → %q", taskID, result)
 	return protocol.TaskCompletePayload{TaskID: taskID, ResultURI: result}
 }
