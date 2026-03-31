@@ -20,20 +20,20 @@ const (
 	EventTaskReverted                    // TransitionTaskState Running → Pending (TCP send failed)
 	EventTaskCompleted                   // CompleteTask: finished successfully
 	EventTaskFailed                      // HandleMAPFailure: exhausted retries or Version A fail
-	EventTaskRetried                     // HandleMAPFailure: retry requeued (attempt N+1)
 	EventJobRegistered                   // RegisterJob: SCATTER accepted, all MAP tasks + GATHER pre-staged
 	EventMAPCompleted                    // RecordMAPComplete: one MAP chunk finished
 	EventMAPFailed                       // RecordMAPFailed: one MAP chunk exhausted all retries
 )
 
 type LogEntry struct {
-	LSN      uint64          `json:"lsn"`
-	UnixNano int64           `json:"ts"`
-	Event    EventType       `json:"event"`
-	TaskID   string          `json:"task_id,omitempty"`
-	JobID    string          `json:"job_id,omitempty"`
-	WorkerID string          `json:"worker_id,omitempty"`
-	Payload  json.RawMessage `json:"payload,omitempty"`
+	LSN      uint64    `json:"lsn"`
+	UnixNano int64     `json:"ts"`
+	Event    EventType `json:"event"`
+	Term     uint64    `json:"term,omitempty"`
+	TaskID   string    `json:"task_id,omitempty"`
+	JobID    string    `json:"job_id,omitempty"`
+	WorkerID string    `json:"worker_id,omitempty"`
+	Payload  []byte    `json:"payload,omitempty"`
 }
 
 type WriteRequest struct {
@@ -48,20 +48,22 @@ type WriteRequest struct {
 
 type GroupCommitWAL struct {
 	path     string
+	snapPath string
 	file     *os.File
 	writer   *bufio.Writer
 	walInbox chan WriteRequest
 	lsn      uint64
 }
 
-func NewGroupCommitWAL(path string) (*GroupCommitWAL, error) {
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+func NewGroupCommitWAL(walPath string, snapPath string) (*GroupCommitWAL, error) {
+	file, err := os.OpenFile(walPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, err
 	}
 
 	w := &GroupCommitWAL{
-		path:     path,
+		path:     walPath,
+		snapPath: snapPath,
 		file:     file,
 		writer:   bufio.NewWriterSize(file, 4*1024*1024),
 		walInbox: make(chan WriteRequest, 10000),
@@ -86,28 +88,22 @@ func (w *GroupCommitWAL) CommitLoop() {
 		case req := <-w.walInbox:
 
 			if req.IsSnapshot {
-				// Flush any pending writes before rotating.
 				if len(batch) > 0 {
 					w.flushAndAck(&batch)
 				}
 
-				// A failed WriteFile followed by a WAL truncation would permanently
-				// destroy recovery data. Now we abort on any I/O error so the WAL
-				// remains intact and can be replayed after the next restart.
-				tmpFile := "snapshot.tmp"
+				// 🚨 Use the dynamic node-specific paths!
+				tmpFile := w.snapPath + ".tmp"
 				if err := os.WriteFile(tmpFile, req.SnapshotData, 0644); err != nil {
-					log.Fatalf("[wal] CRITICAL: failed to write snapshot to %s: %v — WAL NOT truncated", tmpFile, err)
+					log.Fatalf("[wal] CRITICAL: failed to write snapshot to %s: %v", tmpFile, err)
 				}
-				if err := os.Rename(tmpFile, "snapshot.bin"); err != nil {
-					log.Fatalf("[wal] CRITICAL: failed to rename snapshot: %v — WAL NOT truncated", err)
+				if err := os.Rename(tmpFile, w.snapPath); err != nil {
+					log.Fatalf("[wal] CRITICAL: failed to rename snapshot: %v", err)
 				}
 
-				// Rotate the WAL file — wipe it to 0 bytes.
 				w.writer.Flush()
 				w.file.Close()
 
-				// Use w.path not w.file.Name() — Name() returns "" on Windows
-				// after Close(), causing a silent open failure.
 				newFile, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 				if err != nil {
 					log.Fatalf("[wal] catastrophic failure rotating WAL: %v", err)
@@ -115,7 +111,7 @@ func (w *GroupCommitWAL) CommitLoop() {
 				w.file = newFile
 				w.writer.Reset(w.file)
 
-				log.Println("[wal] compacted into snapshot.bin and wiped engine.wal")
+				log.Printf("[wal] compacted into %s and wiped %s", w.snapPath, w.path)
 				continue
 			}
 
@@ -125,7 +121,9 @@ func (w *GroupCommitWAL) CommitLoop() {
 
 			line, _ := json.Marshal(req.Entry)
 			line = append(line, '\n')
-			w.writer.Write(line)
+			if _, err := w.writer.Write(line); err != nil {
+				log.Fatalf("[wal] CRITICAL: disk write failed: %v", err)
+			}
 
 			batch = append(batch, req)
 
@@ -147,10 +145,14 @@ func (w *GroupCommitWAL) flushAndAck(batch *[]WriteRequest) {
 	w.writer.Flush()
 	w.file.Sync()
 
-	for _, req := range *batch {
-		// protocol.SendResponse handles nil conn and sets a write deadline.
-		protocol.SendResponse(req.Conn, req.OpCode, req.RequestID, req.Payload)
-	}
+	ackBatch := make([]WriteRequest, len(*batch))
+	copy(ackBatch, *batch)
+
+	go func(reqs []WriteRequest) {
+		for _, req := range reqs {
+			protocol.SendResponse(req.Conn, req.OpCode, req.RequestID, req.Payload)
+		}
+	}(ackBatch)
 
 	*batch = (*batch)[:0]
 }

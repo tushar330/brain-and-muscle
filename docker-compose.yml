@@ -1,18 +1,70 @@
 version: '3.8'
 
 services:
-  muscle:
-    build: 
+  brain-1:
+    build:
       context: .
-      dockerfile: Dockerfile.worker
+      args:
+        APP: brain
     environment:
-      # host.docker.internal allows the container to talk to the Brain running locally on your laptop
-      - BRAIN_ADDR=host.docker.internal:8080 
-    deploy:
-      resources:
-        limits:
-          cpus: '0.50'     # Hard limit: half a CPU core
-          memory: 512M     # Hard limit: OOM killed if it breaches 512MB
-        reservations:
-          cpus: '0.10'
-          memory: 128M
+      - NODE_ID=brain-1
+      - PEERS=brain-2:8080,brain-3:8080
+      - PORT=8080
+    ports:
+      - "8081:8080" # Host port 8081 maps to Brain 1
+    volumes:
+      - ./:/app
+
+  brain-2:
+    build:
+      context: .
+      args:
+        APP: brain
+    environment:
+      - NODE_ID=brain-2
+      - PEERS=brain-1:8080,brain-3:8080
+      - PORT=8080
+    ports:
+      - "8082:8080" # Host port 8082 maps to Brain 2
+    volumes:
+      - ./:/app
+
+  brain-3:
+    build:
+      context: .
+      args:
+        APP: brain
+    environment:
+      - NODE_ID=brain-3
+      - PEERS=brain-1:8080,brain-2:8080
+      - PORT=8080
+    ports:
+      - "8083:8080" # Host port 8083 maps to Brain 3
+    volumes:
+      - ./:/app
+
+  muscle-1:
+    build:
+      context: .
+      args:
+        APP: muscle
+    environment:
+      - WORKER_ID=muscle-docker-1
+      - BRAIN_ADDR=brain-1:8080,brain-2:8080,brain-3:8080
+      - TOTAL_CPU=2
+      - TOTAL_RAM_MB=1024
+    depends_on:
+      - brain-1
+
+  muscle-2:
+    build:
+      context: .
+      args:
+        APP: muscle
+    environment:
+      - WORKER_ID=muscle-docker-2
+      - BRAIN_ADDR=brain-1:8080,brain-2:8080,brain-3:8080
+      - TOTAL_CPU=2
+      - TOTAL_RAM_MB=1024
+    depends_on:
+      - brain-1

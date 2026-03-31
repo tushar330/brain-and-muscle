@@ -34,4 +34,15 @@ go.work.sum
 engine.wal
 snapshot.bin
 snapshot.tmp
+message_test.go
+raft_state.jsonl
+brain-1_engine.wal
+brain-2_engine.wal
+brain-3_engine.wal
+brain-1_raft_state.jsonl
+brain-2_raft_state.jsonl
+brain-3_raft_state.jsonl
+brain-1_snapshot.bin
+brain-2_snapshot.bin
+brain-3_snapshot.bin
 

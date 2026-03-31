@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,16 +16,12 @@ import (
 )
 
 const (
-	dialTimeout     = 5 * time.Second
 	sendTimeout     = 5 * time.Second
-	maxRetries      = 10
-	baseDelay       = 500 * time.Millisecond
-	maxDelay        = 30 * time.Second
 	maxMessageBytes = 10 * 1024 * 1024 // 10 MB — must match brain
 )
 
 type ConnectionManager struct {
-	addr   string
+	peers  []string // 🚨 THE TOPOLOGY MAP
 	nodeID string
 
 	connMu sync.Mutex
@@ -40,9 +36,9 @@ type ConnectionManager struct {
 	onConnect func()
 }
 
-func NewConnectionManager(addr, nodeID string) *ConnectionManager {
+func NewConnectionManager(peers []string, nodeID string) *ConnectionManager {
 	return &ConnectionManager{
-		addr:    addr,
+		peers:   peers,
 		nodeID:  nodeID,
 		healthy: make(chan struct{}), // starts closed — not yet connected
 		pending: make(map[string]chan protocol.Message),
@@ -56,14 +52,9 @@ func (cm *ConnectionManager) SetOnConnect(hook func()) {
 // Run establishes the initial connection and silently reconnects on failure.
 func (cm *ConnectionManager) Run() {
 	for {
-		log.Printf("[connmgr] connecting to brain at %s", cm.addr)
+		conn := cm.connectRoundRobin()
 
-		conn, err := connectWithBackoff(cm.addr)
-		if err != nil {
-			log.Fatalf("[connmgr] permanent failure: %v", err)
-		}
-
-		log.Printf("[connmgr] connected")
+		log.Printf("[connmgr] connected to %s", conn.RemoteAddr().String())
 		cm.setConn(conn)
 
 		if cm.onConnect != nil {
@@ -75,10 +66,45 @@ func (cm *ConnectionManager) Run() {
 
 		log.Printf("[connmgr] connection lost — draining pending requests and reconnecting")
 		cm.markUnhealthy()
+
+		time.Sleep(2 * time.Second)
 	}
 }
 
-// WaitUntilHealthy blocks the caller until a live connection is available.
+// 🚨 THE FAST-SWEEP DIALER 🚨
+func (cm *ConnectionManager) connectRoundRobin() net.Conn {
+	backoff := 500 * time.Millisecond
+
+	for {
+		// Snapshot the peers safely
+		cm.connMu.Lock()
+		currentPeers := append([]string(nil), cm.peers...)
+		cm.connMu.Unlock()
+
+		for _, targetAddr := range currentPeers {
+			if targetAddr == "" {
+				continue
+			}
+
+			// A 500ms timeout prevents the worker from hanging on dead IPs.
+			conn, err := net.DialTimeout("tcp", targetAddr, 500*time.Millisecond)
+			if err == nil {
+				return conn
+			}
+		}
+
+		// If we reach here, the entire cluster is currently unreachable.
+		log.Printf("[connmgr] All cluster nodes unreachable. Backing off for %v", backoff)
+		time.Sleep(backoff)
+
+		// Cap the backoff at 2 seconds for aggressive sub-second recovery
+		backoff *= 2
+		if backoff > 2*time.Second {
+			backoff = 2 * time.Second
+		}
+	}
+}
+
 func (cm *ConnectionManager) WaitUntilHealthy() {
 	cm.healthyMu.RLock()
 	ch := cm.healthy
@@ -91,29 +117,16 @@ func (cm *ConnectionManager) SendRequest(opCode uint8, payload interface{}) (pro
 
 	requestID := uuid.New().String()
 
-	msg := protocol.Message{
-		NodeID:    cm.nodeID,
-		RequestID: requestID,
-		Timestamp: time.Now(),
-	}
-
+	var rawPayload []byte
 	if payload != nil {
-		raw, err := json.Marshal(payload)
+		var err error
+		rawPayload, err = json.Marshal(payload)
 		if err != nil {
 			return protocol.Message{}, fmt.Errorf("marshal payload: %w", err)
 		}
-		msg.Payload = raw
 	}
 
-	body, err := json.Marshal(msg)
-	if err != nil {
-		return protocol.Message{}, fmt.Errorf("marshal message: %w", err)
-	}
-
-	header := make([]byte, 5)
-	binary.BigEndian.PutUint32(header[0:4], uint32(len(body)))
-	header[4] = opCode
-	frame := append(header, body...)
+	frame := protocol.PackEnvelope(opCode, cm.nodeID, requestID, rawPayload)
 
 	responseCh := make(chan protocol.Message, 1)
 	cm.pendingMu.Lock()
@@ -122,36 +135,65 @@ func (cm *ConnectionManager) SendRequest(opCode uint8, payload interface{}) (pro
 
 	cm.connMu.Lock()
 	conn := cm.conn
+	cm.connMu.Unlock()
+
 	if conn == nil {
-		cm.connMu.Unlock()
 		cm.pendingMu.Lock()
 		delete(cm.pending, requestID)
 		cm.pendingMu.Unlock()
 		return protocol.Message{}, fmt.Errorf("connection dropped before write for opcode 0x%X", opCode)
 	}
 
+	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, writeErr := conn.Write(frame)
-	if writeErr != nil {
-		// sees nil and skips its own Close() on the same underlying connection.
-		cm.conn = nil
-	}
-	cm.connMu.Unlock()
 
 	if writeErr != nil {
 		cm.pendingMu.Lock()
 		delete(cm.pending, requestID)
 		cm.pendingMu.Unlock()
 
-		conn.Close() // close the local copy; markUnhealthy will skip it
+		cm.connMu.Lock()
+		cm.conn = nil
+		cm.connMu.Unlock()
+
+		conn.Close()
 		return protocol.Message{}, fmt.Errorf("write failed: %w", writeErr)
 	}
 
 	select {
 	case resp, ok := <-responseCh:
 		if !ok {
-			// markUnhealthy closed the channel — fast-fail path.
 			return protocol.Message{}, fmt.Errorf("connection lost while waiting for %d response", opCode)
 		}
+
+		if resp.OpCode == protocol.OpRedirect {
+			var redirect protocol.RedirectPayload
+			json.Unmarshal(resp.Payload, &redirect)
+
+			newAddr := redirect.LeaderID
+			if newAddr != "" && !strings.HasSuffix(newAddr, ":8080") {
+				newAddr += ":8080"
+			}
+
+			log.Printf("[connmgr] Redirected by Follower. Switching target to Leader: %s", newAddr)
+
+			// 🚨 DYNAMIC TOPOLOGY SHIFT 🚨
+			// Move the new Leader to the very front of the peers array
+			cm.connMu.Lock()
+			newPeers := []string{newAddr}
+			for _, p := range cm.peers {
+				if p != newAddr && p != "" {
+					newPeers = append(newPeers, p)
+				}
+			}
+			cm.peers = newPeers
+			cm.connMu.Unlock()
+
+			cm.markUnhealthy()
+
+			return protocol.Message{}, fmt.Errorf("redirected to %s", newAddr)
+		}
+
 		return resp, nil
 
 	case <-time.After(sendTimeout):
@@ -162,7 +204,6 @@ func (cm *ConnectionManager) SendRequest(opCode uint8, payload interface{}) (pro
 	}
 }
 
-// readLoop is the ONLY goroutine that reads from the socket.
 func (cm *ConnectionManager) readLoop(conn net.Conn) {
 	for {
 		header := make([]byte, 5)
@@ -183,13 +224,19 @@ func (cm *ConnectionManager) readLoop(conn net.Conn) {
 			return
 		}
 
-		var msg protocol.Message
-		if err := json.Unmarshal(body, &msg); err != nil {
-			log.Printf("[readloop] unmarshal error: %v — skipping frame", err)
+		nodeID, reqID, _, payloadBytes, err := protocol.UnpackEnvelope(body)
+
+		if err != nil {
+			log.Printf("[readloop] unpack error: %v — skipping frame", err)
 			continue
 		}
 
-		msg.OpCode = header[4]
+		msg := protocol.Message{
+			OpCode:    header[4],
+			NodeID:    nodeID,
+			RequestID: reqID,
+			Payload:   payloadBytes,
+		}
 
 		cm.pendingMu.Lock()
 		ch, found := cm.pending[msg.RequestID]
@@ -212,7 +259,7 @@ func (cm *ConnectionManager) setConn(conn net.Conn) {
 	cm.connMu.Unlock()
 
 	cm.healthyMu.Lock()
-	close(cm.healthy) // unblocks all goroutines waiting in WaitUntilHealthy
+	close(cm.healthy)
 	cm.healthyMu.Unlock()
 }
 
@@ -225,7 +272,11 @@ func (cm *ConnectionManager) markUnhealthy() {
 	cm.connMu.Unlock()
 
 	cm.healthyMu.Lock()
-	cm.healthy = make(chan struct{}) // worker loops will block on next WaitUntilHealthy
+	select {
+	case <-cm.healthy:
+		cm.healthy = make(chan struct{})
+	default:
+	}
 	cm.healthyMu.Unlock()
 
 	cm.pendingMu.Lock()
@@ -234,32 +285,4 @@ func (cm *ConnectionManager) markUnhealthy() {
 		delete(cm.pending, id)
 	}
 	cm.pendingMu.Unlock()
-}
-
-func connectWithBackoff(addr string) (net.Conn, error) {
-	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		conn, err := net.DialTimeout("tcp", addr, dialTimeout)
-		if err == nil {
-			return conn, nil
-		}
-		lastErr = err
-
-		if attempt == maxRetries-1 {
-			break // no sleep on the last attempt
-		}
-
-		delay := baseDelay * (1 << attempt)
-		if delay > maxDelay {
-			delay = maxDelay
-		}
-		jitter := 0.5 + rand.Float64()
-		sleep := time.Duration(float64(delay) * jitter)
-
-		log.Printf("[dial] attempt %d/%d failed: %v — retrying in %v",
-			attempt+1, maxRetries, err, sleep.Round(time.Millisecond))
-
-		time.Sleep(sleep)
-	}
-	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
 }

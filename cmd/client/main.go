@@ -13,77 +13,92 @@ import (
 )
 
 func main() {
-	// 1. Connect to the Brain
-	conn, err := net.Dial("tcp", "localhost:8080")
-	if err != nil {
-		log.Fatalf("Failed to connect to Brain: %v", err)
+	targetNode := "brain-1" // Starting guess
+
+	// Map internal cluster IDs to your localhost exposed ports
+	topology := map[string]string{
+		"brain-1": "localhost:8081",
+		"brain-2": "localhost:8082",
+		"brain-3": "localhost:8083",
 	}
-	defer conn.Close()
 
-	log.Println("Connected to Brain. Preparing SCATTER job...")
-
-	// 2. The User Payload (What the Muscle worker actually executes)
-	// We pass dummy args here to simulate work.
 	userPayload := map[string]interface{}{
 		"command": "process_data",
 		"args":    []string{"chunk_data"},
 	}
 	userPayloadBytes, _ := json.Marshal(userPayload)
 
-	// 3. The SubmitTask Envelope
 	submitReq := protocol.SubmitTaskPayload{
 		QueueName:   "default",
 		Payload:     string(userPayloadBytes),
 		RequiredCPU: 1,
 		RequiredRAM: 64,
 		JobType:     "SCATTER",
-		TotalMAPs:   10, // 100 Chunks! Plenty of time to crash the Brain.
+		TotalMAPs:   50,
 	}
 	submitReqBytes, _ := json.Marshal(submitReq)
 
-	// 4. The Network Message
-	msg := protocol.Message{
-		RequestID: uuid.New().String(),
-		Timestamp: time.Now(),
-		Payload:   submitReqBytes,
+	log.Println("Initializing Smart Client Topology Router...")
+
+	// The Autonomous Retry Loop
+	for attempt := 1; attempt <= 5; attempt++ {
+		targetAddr := topology[targetNode]
+		log.Printf("[Attempt %d] Dialing %s at %s...", attempt, targetNode, targetAddr)
+
+		conn, err := net.DialTimeout("tcp", targetAddr, 2*time.Second)
+		if err != nil {
+			log.Printf("❌ Failed to connect to %s. Retrying in 2s...", targetNode)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		reqID := uuid.New().String()
+		frame := protocol.PackEnvelope(protocol.OpSubmitTask, "test-client", reqID, submitReqBytes)
+		conn.Write(frame)
+
+		// 🚨 THE DEADLINE SHIELD: Physically prevents infinite hanging
+		conn.SetReadDeadline(time.Now().Add(7 * time.Second))
+
+		respHeader := make([]byte, 5)
+		if _, err := io.ReadFull(conn, respHeader); err != nil {
+			log.Printf("❌ Network timeout/error waiting for Brain: %v", err)
+			conn.Close()
+			continue
+		}
+
+		respLen := binary.BigEndian.Uint32(respHeader[0:4])
+		respOp := respHeader[4]
+		respBody := make([]byte, respLen)
+		io.ReadFull(conn, respBody)
+
+		_, _, _, payloadBytes, _ := protocol.UnpackEnvelope(respBody)
+
+		// Handle the response autonomously
+		if respOp == protocol.OpTaskAccepted {
+			var accepted protocol.TaskAcceptedPayload
+			json.Unmarshal(payloadBytes, &accepted)
+			log.Printf("✅ SUCCESS! Job ID: %s committed to the cluster.", accepted.TaskID)
+			conn.Close()
+			return
+
+		} else if respOp == protocol.OpRedirect {
+			var redirect protocol.RedirectPayload
+			json.Unmarshal(payloadBytes, &redirect)
+
+			if redirect.LeaderID == "" {
+				log.Println("⚠️ Cluster is electing a new Leader. Backing off 2 seconds...")
+				time.Sleep(2 * time.Second)
+			} else {
+				log.Printf("⚠️ Redirected! New Leader is: %s", redirect.LeaderID)
+				targetNode = redirect.LeaderID
+			}
+
+		} else {
+			log.Printf("❌ BRAIN ERROR: %s", string(payloadBytes))
+		}
+
+		conn.Close()
 	}
-	msgBytes, _ := json.Marshal(msg)
 
-	// 5. The 5-Byte Binary Frame (Method A Architecture)
-	header := make([]byte, 5)
-	binary.BigEndian.PutUint32(header[0:4], uint32(len(msgBytes)))
-	header[4] = protocol.OpSubmitTask // The all-important OpCode
-
-	frame := append(header, msgBytes...)
-
-	log.Println("Submitting SCATTER job (100 MAP chunks)...")
-	if _, err = conn.Write(frame); err != nil {
-		log.Fatalf("Failed to write to connection: %v", err)
-	}
-
-	// 6. Wait for the WAL to flush and the Brain to ACK
-	respHeader := make([]byte, 5)
-	if _, err := io.ReadFull(conn, respHeader); err != nil {
-		log.Fatalf("Failed to read Brain response: %v", err)
-	}
-
-	respLen := binary.BigEndian.Uint32(respHeader[0:4])
-	respOp := respHeader[4]
-
-	respBody := make([]byte, respLen)
-	if _, err := io.ReadFull(conn, respBody); err != nil {
-		log.Fatalf("Failed to read Brain payload: %v", err)
-	}
-
-	if respOp == protocol.OpTaskAccepted {
-		var ack protocol.Message
-		json.Unmarshal(respBody, &ack)
-		var accepted protocol.TaskAcceptedPayload
-		json.Unmarshal(ack.Payload, &accepted)
-
-		log.Printf("✅ SUCCESS! Brain accepted Job ID: %s", accepted.TaskID)
-		log.Println("🔥 NOW HURRY! GO TO TERMINAL 1 AND PRESS CTRL+C TO CRASH THE BRAIN! 🔥")
-	} else {
-		log.Printf("❌ Unexpected response OpCode: 0x%X", respOp)
-	}
+	log.Fatalf("❌ FATAL: Failed to submit task after 5 attempts.")
 }

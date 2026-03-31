@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/akashtripathi12/brain-and-muscle/internal/protocol"
@@ -63,6 +66,7 @@ type JobMeta struct {
 }
 
 type KVStore struct {
+	mu      sync.RWMutex
 	tasks   map[string]*Task
 	workers map[string]*Worker
 	queues  map[string][]string
@@ -71,6 +75,7 @@ type KVStore struct {
 
 func NewKVStore() *KVStore {
 	return &KVStore{
+		mu:      sync.RWMutex{},
 		tasks:   make(map[string]*Task),
 		workers: make(map[string]*Worker),
 		queues:  make(map[string][]string),
@@ -92,10 +97,6 @@ func (kv *KVStore) ApplyReplayEvent(entry wal.LogEntry) {
 		kv.SetTask(&task)
 
 	case wal.EventTaskDispatched:
-		// During live operation, PopBestFitTask removes the task from
-		// the queue BEFORE TransitionTaskState marks it Running. Replay skips
-		// PopBestFitTask, so the task stays in kv.queues as a ghost entry forever.
-		// We must explicitly dequeue here to match the live code path.
 		if task, ok := kv.tasks[entry.TaskID]; ok {
 			kv.removeFromQueue(task.QueueName, entry.TaskID)
 		}
@@ -113,8 +114,6 @@ func (kv *KVStore) ApplyReplayEvent(entry wal.LogEntry) {
 		kv.HandleMAPFailure(entry.TaskID, entry.WorkerID)
 
 	case wal.EventJobRegistered:
-		// Replay restores the whole SCATTER job (job meta + all MAP tasks) from a
-		// single WAL record, so there is no partial-replay window.
 		var payload protocol.JobRegisteredPayload
 		json.Unmarshal(entry.Payload, &payload)
 		var gatherTask Task
@@ -140,6 +139,9 @@ func (kv *KVStore) ApplyReplayEvent(entry wal.LogEntry) {
 // ─── Task operations ─────────────────────────────────────────────────────────
 
 func (kv *KVStore) SetTask(task *Task) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	kv.tasks[task.ID] = task
 	if task.Status == StatusPending {
 		kv.enqueueTask(task)
@@ -149,6 +151,9 @@ func (kv *KVStore) SetTask(task *Task) {
 // PopBestFitTask selects the highest-scoring pending task whose resource
 // requirements fit within availCPU / availRAM.
 func (kv *KVStore) PopBestFitTask(queueName string, availCPU, availRAM int) (Task, bool) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	ids := kv.queues[queueName]
 	if len(ids) == 0 {
 		return Task{}, false
@@ -216,6 +221,9 @@ func (kv *KVStore) PopBestFitTask(queueName string, availCPU, availRAM int) (Tas
 }
 
 func (kv *KVStore) GetTask(id string) (Task, bool) {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+
 	task, ok := kv.tasks[id]
 	if !ok {
 		return Task{}, false
@@ -224,6 +232,9 @@ func (kv *KVStore) GetTask(id string) (Task, bool) {
 }
 
 func (kv *KVStore) GetJob(jobID string) (JobMeta, bool) {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+
 	job, ok := kv.jobs[jobID]
 	if !ok {
 		return JobMeta{}, false
@@ -231,7 +242,33 @@ func (kv *KVStore) GetJob(jobID string) (JobMeta, bool) {
 	return *job, true
 }
 
+func (kv *KVStore) GetMaxRaftIndex() uint64 {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+	maxIdx := uint64(0)
+	for id := range kv.tasks {
+		parts := strings.Split(id, "-")
+		if len(parts) >= 2 {
+			if idx, err := strconv.ParseUint(parts[1], 10, 64); err == nil && idx > maxIdx {
+				maxIdx = idx
+			}
+		}
+	}
+	for id := range kv.jobs {
+		parts := strings.Split(id, "-")
+		if len(parts) >= 2 {
+			if idx, err := strconv.ParseUint(parts[1], 10, 64); err == nil && idx > maxIdx {
+				maxIdx = idx
+			}
+		}
+	}
+	return maxIdx
+}
+
 func (kv *KVStore) TransitionTaskState(id string, from, to TaskStatus, workerID string) error {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	task, ok := kv.tasks[id]
 	if !ok {
 		return fmt.Errorf("task %s not found", id)
@@ -255,6 +292,9 @@ func (kv *KVStore) TransitionTaskState(id string, from, to TaskStatus, workerID 
 }
 
 func (kv *KVStore) CompleteTask(taskID string, result string) error {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	task, ok := kv.tasks[taskID]
 	if !ok {
 		return fmt.Errorf("task %s not found", taskID)
@@ -269,6 +309,9 @@ func (kv *KVStore) CompleteTask(taskID string, result string) error {
 }
 
 func (kv *KVStore) HandleMAPFailure(taskID, ownerWorkerID string) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	task, ok := kv.tasks[taskID]
 	if !ok {
 		return
@@ -307,19 +350,15 @@ func (kv *KVStore) HandleMAPFailure(taskID, ownerWorkerID string) {
 	kv.RecordMAPFailed(task.JobID)
 }
 
-func (kv *KVStore) RequeueDeadWorkerTasks(workerID string) []string {
+func (kv *KVStore) GetWorkerTaskIDs(workerID string) []string {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+
 	var deadTaskIDs []string
 	for id, task := range kv.tasks {
 		if task.Status == StatusRunning && task.AssignedWorkerID == workerID {
 			deadTaskIDs = append(deadTaskIDs, id)
 		}
-	}
-	for _, taskID := range deadTaskIDs {
-		kv.HandleMAPFailure(taskID, workerID)
-	}
-	if len(deadTaskIDs) > 0 {
-		log.Printf("[watcher] routed %d tasks from dead worker %s through failure handler",
-			len(deadTaskIDs), workerID)
 	}
 	return deadTaskIDs
 }
@@ -327,6 +366,9 @@ func (kv *KVStore) RequeueDeadWorkerTasks(workerID string) []string {
 // SweepTerminalState safely removes tasks and jobs that have been completed or
 // failed for longer than the given TTL, preventing unbounded memory growth.
 func (kv *KVStore) SweepTerminalState(ttl time.Duration) (int, int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	now := time.Now()
 	tasksFreed, jobsFreed := 0, 0
 
@@ -341,6 +383,9 @@ func (kv *KVStore) SweepTerminalState(ttl time.Duration) (int, int) {
 					delete(kv.jobs, id)
 					jobsFreed++
 				}
+			} else {
+				delete(kv.jobs, id)
+				jobsFreed++
 			}
 		}
 	}
@@ -360,6 +405,9 @@ func (kv *KVStore) SweepTerminalState(ttl time.Duration) (int, int) {
 // removeFromQueue removes a single taskID from the named queue in O(n).
 // Used by ApplyReplayEvent (Bug 1 fix) and internally by PopBestFitTask.
 func (kv *KVStore) removeFromQueue(queueName string, taskID string) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	q := kv.queues[queueName]
 	for i, id := range q {
 		if id == taskID {
@@ -381,6 +429,9 @@ func (kv *KVStore) enqueueTask(task *Task) {
 
 // RegisterJob creates the JobMeta and pre-stages the GATHER task.
 func (kv *KVStore) RegisterJob(jobID string, totalMAPs int, gatherTask *Task) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	// Store a canonical copy in kv.tasks.
 	taskCopy := *gatherTask
 	kv.tasks[taskCopy.ID] = &taskCopy
@@ -396,6 +447,9 @@ func (kv *KVStore) RegisterJob(jobID string, totalMAPs int, gatherTask *Task) {
 }
 
 func (kv *KVStore) RecordMAPComplete(jobID string, chunkIndex int, resultURI string) error {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	job, ok := kv.jobs[jobID]
 	if !ok {
 		return fmt.Errorf("job %s not found", jobID)
@@ -438,6 +492,9 @@ func (kv *KVStore) RecordMAPComplete(jobID string, chunkIndex int, resultURI str
 }
 
 func (kv *KVStore) RecordMAPFailed(jobID string) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	job, ok := kv.jobs[jobID]
 	if !ok {
 		return
@@ -463,12 +520,18 @@ func (kv *KVStore) RecordMAPFailed(jobID string) {
 // Queue introspection
 
 func (kv *KVStore) QueueDepth(queueName string) int {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+
 	return len(kv.queues[queueName])
 }
 
 // Worker registry
 
 func (kv *KVStore) RegisterWorker(id string, totalCPU, totalRAM int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	existing := kv.workers[id]
 	w := &Worker{
 		ID:       id,
@@ -484,6 +547,9 @@ func (kv *KVStore) RegisterWorker(id string, totalCPU, totalRAM int) {
 }
 
 func (kv *KVStore) GetWorker(workerID string) (Worker, bool) {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+
 	w, ok := kv.workers[workerID]
 	if !ok {
 		return Worker{}, false
@@ -492,6 +558,9 @@ func (kv *KVStore) GetWorker(workerID string) (Worker, bool) {
 }
 
 func (kv *KVStore) UpdateWorkerHeartbeat(workerID string, availCPU, availRAM int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	w, ok := kv.workers[workerID]
 	if !ok {
 		w = &Worker{ID: workerID}
@@ -503,6 +572,9 @@ func (kv *KVStore) UpdateWorkerHeartbeat(workerID string, availCPU, availRAM int
 }
 
 func (kv *KVStore) GetDeadWorkers(deadline time.Duration) []string {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+
 	var dead []string
 	cutoff := time.Now().Add(-deadline)
 	for id, w := range kv.workers {
@@ -514,6 +586,9 @@ func (kv *KVStore) GetDeadWorkers(deadline time.Duration) []string {
 }
 
 func (kv *KVStore) RemoveWorker(workerID string) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	delete(kv.workers, workerID)
 }
 
@@ -526,6 +601,9 @@ type StateSnapShot struct {
 }
 
 func (kv *KVStore) ExportSnapshot() []byte {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+
 	snap := StateSnapShot{
 		Tasks:  kv.tasks,
 		Queues: kv.queues,
@@ -536,6 +614,9 @@ func (kv *KVStore) ExportSnapshot() []byte {
 }
 
 func (kv *KVStore) ImportSnapshot(data []byte) error {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	var snap StateSnapShot
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err

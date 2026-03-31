@@ -112,19 +112,33 @@ func NewWorker(cm *ConnectionManager, totalCPU, totalRAM int) *Worker {
 func (w *Worker) Register() {
 	totalCPU, totalRAM := w.semaphore.Total()
 
-	resp, err := w.cm.SendRequest(protocol.OpRegisterWorker, protocol.RegisterWorkerPayload{
-		TotalCPU: totalCPU,
-		TotalRAM: totalRAM,
-	})
-	if err != nil {
-		log.Printf("[register] failed: %v", err)
+	for {
+		resp, err := w.cm.SendRequest(protocol.OpRegisterWorker, protocol.RegisterWorkerPayload{
+			TotalCPU: totalCPU,
+			TotalRAM: totalRAM,
+		})
+
+		if err != nil {
+			log.Printf("[register] network error: %v, retrying...", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		if resp.OpCode == protocol.OpError {
+			log.Printf("[register] Brain returned error (Election in progress?), retrying in 1s...")
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		if resp.OpCode != protocol.OpWorkerRegistered {
+			log.Printf("[register] unexpected ack: %d, retrying in 1s...", resp.OpCode)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		log.Printf("[register] registered with Brain — %d CPU / %d MB RAM", totalCPU, totalRAM)
 		return
 	}
-	if resp.OpCode != protocol.OpWorkerRegistered {
-		log.Printf("[register] unexpected ack: %d", resp.OpCode)
-		return
-	}
-	log.Printf("[register] registered with Brain — %d CPU / %d MB RAM", totalCPU, totalRAM)
 }
 
 // HeartbeatLoop sends a HEARTBEAT with current free resources every heartbeatEvery interval.
@@ -144,6 +158,12 @@ func (w *Worker) HeartbeatLoop() {
 			log.Printf("[heartbeat] failed: %v", err)
 			continue
 		}
+
+		if resp.OpCode == protocol.OpError {
+			log.Printf("[heartbeat] Brain is currently electing a new leader... retrying locally later")
+			continue
+		}
+
 		if resp.OpCode != protocol.OpHeartbeatAck {
 			log.Printf("[heartbeat] unexpected response: %d", resp.OpCode)
 		}
@@ -196,8 +216,13 @@ func (w *Worker) TaskRequestLoop() {
 			log.Printf("[task] acquired %d CPU / %d MB RAM for task %s", cpu, ram, task.ID)
 			go w.runTask(task, cpu, ram)
 
+		case protocol.OpError:
+			log.Printf("[task] Brain returned error: %s — backing off %v", string(resp.Payload), backoffDuration)
+			time.Sleep(backoffDuration)
+
 		default:
-			log.Printf("[task] unexpected opcode: %d", resp.OpCode)
+			log.Printf("[task] unexpected opcode: %d — backing off %v", resp.OpCode, backoffDuration)
+			time.Sleep(backoffDuration)
 		}
 	}
 }

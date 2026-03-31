@@ -5,33 +5,49 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/akashtripathi12/brain-and-muscle/internal/muscle"
 )
 
 func main() {
-	brainAddr := envOrDefault("BRAIN_ADDR", "localhost:8080")
+	// Accept a comma-separated list of brain addresses
+	brainAddrs := envOrDefault("BRAIN_ADDR", "localhost:8080")
 	workerID := envOrDefault("WORKER_ID", "muscle-1")
 
 	totalCPU := envInt("TOTAL_CPU", runtime.NumCPU())
 	totalRAM := envInt("TOTAL_RAM_MB", 4096)
 
 	log.Printf("muscle worker %s starting — brain at %s (%d CPU / %d MB RAM)",
-		workerID, brainAddr, totalCPU, totalRAM)
+		workerID, brainAddrs, totalCPU, totalRAM)
 
-	cm := muscle.NewConnectionManager(brainAddr, workerID)
+	// 🚨 THE TOPOLOGY FIX 🚨
+	// Parse the comma-separated string into a slice of peers
+	var peers []string
+	if brainAddrs != "" {
+		peers = strings.Split(brainAddrs, ",")
+	} else {
+		peers = []string{"localhost:8080"} // Fallback
+	}
+
+	// Pass the slice of peers to the new Round-Robin ConnectionManager
+	cm := muscle.NewConnectionManager(peers, workerID)
 	w := muscle.NewWorker(cm, totalCPU, totalRAM)
 
-	// NEW: Tell the ConnectionManager to register us EVERY TIME it connects!
+	var registerMu sync.Mutex
+
 	cm.SetOnConnect(func() {
-		log.Println("[system] TCP connected. Announcing resources to Brain...")
+		if !registerMu.TryLock() {
+			return
+		}
+		defer registerMu.Unlock()
+
+		log.Println("[system] Reconnected. Re-registering with Brain...")
 		w.Register()
 	})
 
-	// Run the connection loop (this will trigger the hook on the first connect too)
 	go cm.Run()
-
-	// Wait until the first connection is established and the hook fires
 	cm.WaitUntilHealthy()
 
 	go w.HeartbeatLoop()

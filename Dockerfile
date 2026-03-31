@@ -1,12 +1,21 @@
 FROM golang:1.25-alpine AS builder
-WORKDIR /app
+WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
-RUN go build -o /bin/brain ./cmd/brain/main.go
-RUN go build -o /bin/muscle ./cmd/muscle/main.go
 
+COPY . .
+
+# We use an ARG to decide which binary to build (brain, muscle, or client)
+ARG APP
+RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/app ./cmd/${APP}
+
+# Run Stage
 FROM alpine:latest
+
+COPY --from=builder /bin/app /usr/local/bin/app
+
 WORKDIR /app
-COPY --from=builder /bin/brain /app/brain
-COPY --from=builder /bin/muscle /app/muscle
+
+EXPOSE 8080
+
+CMD ["app"]
