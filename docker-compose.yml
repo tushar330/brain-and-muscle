@@ -55,6 +55,10 @@ services:
       - TOTAL_RAM_MB=1024
     depends_on:
       - brain-1
+    volumes:
+      - ./reports:/app/reports
+      - ./datasets:/app/datasets
+      - /var/run/docker.sock:/var/run/docker.sock
 
   muscle-2:
     build:
@@ -68,3 +72,7 @@ services:
       - TOTAL_RAM_MB=1024
     depends_on:
       - brain-1
+    volumes:
+      - ./reports:/app/reports
+      - ./datasets:/app/datasets
+      - /var/run/docker.sock:/var/run/docker.sock

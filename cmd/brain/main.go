@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	workerTimeout   = 15 * time.Second
+	workerTimeout   = 60 * time.Second
 	watcherInterval = 5 * time.Second
 	maxMessageBytes = 10 * 1024 * 1024
 )

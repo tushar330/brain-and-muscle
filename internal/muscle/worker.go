@@ -2,15 +2,21 @@ package muscle
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/akashtripathi12/brain-and-muscle/internal/protocol"
+	"github.com/dop251/goja"
 )
 
 // s3Bucket is the storage bucket name. Override with S3_BUCKET env var.
@@ -97,13 +103,27 @@ const (
 type Worker struct {
 	cm        *ConnectionManager
 	semaphore *ResourcePool
+	engine    *ExecutionEngine
 }
 
 // NewWorker creates a Worker with a resource pool sized to the node's actual limits.
 func NewWorker(cm *ConnectionManager, totalCPU, totalRAM int) *Worker {
+	// Initialize the Strategy Engine
+	engine := NewExecutionEngine()
+
+	// Register JavaScript
+	engine.Register("execute_js", &GojaRuntime{})
+
+	// Register Python Warm Pool (it boots when the worker turns on!)
+	engine.Register("execute_python", InitDockerWarmPool("python:3.10-slim", []string{"python", "-c"}))
+
+	// Register Node Warm Pool (it boots when the worker turns on!)
+	engine.Register("execute_node", InitDockerWarmPool("node:18-alpine", []string{"node", "-e"}))
+
 	return &Worker{
 		cm:        cm,
 		semaphore: NewResourcePool(totalCPU, totalRAM),
+		engine:    engine,
 	}
 }
 
@@ -249,7 +269,7 @@ func (w *Worker) runTask(task protocol.AssignedTask, cpu, ram int) {
 
 	log.Printf("[exec] starting task %s (payload: %s)", task.ID, task.Payload)
 
-	result := executeAssignedTask(task)
+	result := w.executeAssignedTask(task)
 
 	// An empty TaskID signals that execution failed (unmarshal error, unknown
 	// job_type, or a command that exited non-zero). Send OpTaskFailed so the
@@ -285,24 +305,148 @@ func (w *Worker) runTask(task protocol.AssignedTask, cpu, ram int) {
 }
 
 // executeAssignedTask is the top-level execution router.
-func executeAssignedTask(assigned protocol.AssignedTask) protocol.TaskCompletePayload {
-	var payload protocol.Payload
+func (w *Worker) executeAssignedTask(assigned protocol.AssignedTask) protocol.TaskCompletePayload {
+	var p protocol.Payload
 
-	if err := json.Unmarshal([]byte(assigned.Payload), &payload); err != nil {
+	if err := json.Unmarshal([]byte(assigned.Payload), &p); err != nil {
 		log.Printf("[exec] failed to unmarshal payload for task %s: %v", assigned.ID, err)
-		return protocol.TaskCompletePayload{} // empty TaskID → failure path in runTask
+		return protocol.TaskCompletePayload{}
 	}
 
-	switch payload.JobType {
+	// 1. Check if the client requested a supported language strategy
+	strategy, exists := w.engine.strategies[p.Command]
+	if exists {
+		if len(p.Args) < 1 {
+			log.Printf("[exec] missing script in args for command %s", p.Command)
+			return protocol.TaskCompletePayload{}
+		}
+		script := p.Args[0]
+		faasArgs := p.Args[1:]
+
+		// BLIND EXECUTION! The Engine handles everything.
+		return strategy.Execute(assigned.ID, script, faasArgs, p)
+	}
+
+	// 2. Legacy Go fallbacks
+	switch p.JobType {
 	case "MAP":
-		return executeMAPTask(assigned.ID, payload)
+		return executeMAPTask(assigned.ID, p)
 	case "GATHER":
-		return executeGatherTask(assigned.ID, payload)
+		return executeGatherTask(assigned.ID, p)
 	case "":
-		return executeStandardTask(assigned.ID, payload)
+		return executeStandardTask(assigned.ID, p)
 	default:
-		log.Printf("[exec] unknown job_type=%q for task %s — reporting failure", payload.JobType, assigned.ID)
-		return protocol.TaskCompletePayload{} // empty TaskID → failure path in runTask
+		return protocol.TaskCompletePayload{}
+	}
+}
+
+// This spins up an isolated sandbox, injects Go's crypto speed, and runs the user's code!
+// This spins up an isolated sandbox, injects Go's crypto speed, and runs the user's code!
+func executeJSTask(taskID, script string, args []string, p protocol.Payload) protocol.TaskCompletePayload {
+	vm := goja.New()
+
+	// INJECT CRYPTO
+	vm.Set("hashSHA256", func(input string) string {
+		h := sha256.Sum256([]byte(input))
+		return hex.EncodeToString(h[:])
+	})
+
+	// 🚨 INJECT DATA FETCHER 🚨
+	// This allows JS to download files directly from S3 or HTTP!
+	vm.Set("fetchData", func(uri string) string {
+		data, err := fetchDataset(uri)
+		if err != nil {
+			log.Printf("[faas] dataset fetch error: %v", err)
+			return ""
+		}
+		return data
+	})
+
+	vm.Set("CHUNK_INDEX", p.ChunkIndex)
+
+	_, err := vm.RunString(script)
+	if err != nil {
+		log.Printf("[faas] VM compilation failed for task %s: %v", taskID, err)
+		return protocol.TaskCompletePayload{}
+	}
+
+	mapTaskVal := vm.Get("MapTask")
+	if mapTaskVal == nil {
+		log.Printf("[faas] MapTask function not found in script")
+		return protocol.TaskCompletePayload{}
+	}
+
+	mapTaskFn, ok := goja.AssertFunction(mapTaskVal)
+	if !ok {
+		log.Printf("[faas] MapTask is not a valid JS function")
+		return protocol.TaskCompletePayload{}
+	}
+
+	jsArgs := vm.ToValue(args)
+
+	res, err := mapTaskFn(goja.Undefined(), jsArgs)
+	if err != nil {
+		log.Printf("[faas] Execution error in JS for task %s: %v", taskID, err)
+		return protocol.TaskCompletePayload{}
+	}
+
+	result := res.String()
+	log.Printf("[faas] task=%s finished -> %s", taskID, result)
+
+	return protocol.TaskCompletePayload{
+		TaskID:     taskID,
+		JobID:      p.JobID,
+		JobType:    "MAP",
+		ChunkIndex: p.ChunkIndex,
+		ResultURI:  result,
+	}
+}
+
+// executeJSGather spins up a VM specifically to run the user's ReduceTask()
+func executeJSGather(taskID, script string, p protocol.Payload) protocol.TaskCompletePayload {
+	vm := goja.New()
+
+	_, err := vm.RunString(script)
+	if err != nil {
+		log.Printf("[faas] VM compilation failed for GATHER task %s: %v", taskID, err)
+		return protocol.TaskCompletePayload{}
+	}
+
+	reduceTaskVal := vm.Get("ReduceTask")
+	if reduceTaskVal == nil {
+		log.Printf("[faas] ReduceTask function not found in user script!")
+		return protocol.TaskCompletePayload{}
+	}
+
+	reduceTaskFn, ok := goja.AssertFunction(reduceTaskVal)
+	if !ok {
+		log.Printf("[faas] ReduceTask is not a valid JS function")
+		return protocol.TaskCompletePayload{}
+	}
+
+	// Pass all the chunk outputs (InputURIs) directly to the JS Reducer
+	jsInputs := vm.ToValue(p.InputURIs)
+
+	res, err := reduceTaskFn(goja.Undefined(), jsInputs)
+	if err != nil {
+		log.Printf("[faas] Execution error in JS Reducer: %v", err)
+		return protocol.TaskCompletePayload{}
+	}
+
+	// The JS script generated the report! Just save it to disk.
+	reportString := res.String()
+
+	os.MkdirAll("./reports", 0755)
+	fileName := fmt.Sprintf("./reports/%s_report.txt", p.JobID)
+	os.WriteFile(fileName, []byte(reportString), 0644)
+
+	log.Printf("[gather] ✅ UNIVERSAL REPORT EXFILTRATED -> %s", fileName)
+
+	return protocol.TaskCompletePayload{
+		TaskID:    taskID,
+		JobID:     p.JobID,
+		JobType:   "GATHER",
+		ResultURI: fileName,
 	}
 }
 
@@ -331,23 +475,77 @@ func executeMAPTask(taskID string, p protocol.Payload) protocol.TaskCompletePayl
 // It receives the set of MAP output URIs (Claim Checks) injected by the Brain
 // and merges them into a single final result.
 func executeGatherTask(taskID string, p protocol.Payload) protocol.TaskCompletePayload {
-	log.Printf("[gather] task=%s job=%s merging %d inputs",
-		taskID, p.JobID, len(p.InputURIs))
+	log.Printf("[gather] task=%s job=%s merging %d inputs", taskID, p.JobID, len(p.InputURIs))
 
-	for i, uri := range p.InputURIs {
-		log.Printf("[gather] task=%s input[%d] = %s", taskID, i, uri)
-		// TODO: download uri → local tmp file
+	var crackedPassword string
+	failedChunks := 0
+
+	// The Brain passes all 26 outputs into p.InputURIs automatically!
+	for _, data := range p.InputURIs {
+		if strings.Contains(data, "SUCCESS") {
+			// Extract the successful password
+			var result struct {
+				Password string `json:"password"`
+			}
+			json.Unmarshal([]byte(data), &result)
+			crackedPassword = result.Password
+		} else {
+			failedChunks++
+		}
 	}
 
-	time.Sleep(1 * time.Second)
+	// 🚨 BUILD THE BEAUTIFUL REPORT 🚨
+	report := "========================================\n"
+	report += fmt.Sprintf("  JOB REPORT: %s\n", p.JobID)
+	report += "========================================\n"
+	report += fmt.Sprintf("Total Chunks Processed : %d\n", len(p.InputURIs))
+	report += fmt.Sprintf("Failed / Empty Chunks  : %d\n\n", failedChunks)
 
-	finalURI := fmt.Sprintf("s3://%s/%s/final_result.json", s3Bucket, p.JobID)
-	log.Printf("[gather] task=%s done → %s", taskID, finalURI)
+	report += "PER-CHUNK DETAILS:\n"
+	report += "----------------------------------------\n"
+
+	// alphabet is at index 2 of args (since index 0 is script and 1 is hash in faas logic)
+	// Actually, in the GATHER task, p.Args is [script, hash, alphabet, length]
+	alphabet := ""
+	if len(p.Args) >= 3 {
+		alphabet = p.Args[2]
+	}
+
+	for i, data := range p.InputURIs {
+		char := "?"
+		if i < len(alphabet) {
+			char = string(alphabet[i])
+		}
+
+		status := "FAILED"
+		if strings.Contains(data, "SUCCESS") {
+			status = "SUCCESS 🟢"
+		}
+		report += fmt.Sprintf("Chunk #%02d (Char: '%s') -> [%s]\n", i, char, status)
+	}
+	report += "----------------------------------------\n\n"
+
+	if crackedPassword != "" {
+		report += "STATUS: [SUCCESS] 🟢\n"
+		report += fmt.Sprintf("CRACKED PASSWORD: %s\n", crackedPassword)
+	} else {
+		report += "STATUS: [FAILED] 🔴\n"
+		report += "PASSWORD NOT FOUND IN SEARCH SPACE.\n"
+	}
+	report += "========================================\n"
+
+	// Write it directly to the shared Docker volume!
+	os.MkdirAll("./reports", 0755)
+	fileName := fmt.Sprintf("./reports/%s_report.txt", p.JobID)
+	os.WriteFile(fileName, []byte(report), 0644)
+
+	log.Printf("[gather] ✅ REPORT EXFILTRATED TO DISK -> %s", fileName)
+
 	return protocol.TaskCompletePayload{
 		TaskID:    taskID,
 		JobID:     p.JobID,
 		JobType:   "GATHER",
-		ResultURI: finalURI,
+		ResultURI: fileName,
 	}
 }
 
@@ -374,4 +572,21 @@ func executeStandardTask(taskID string, p protocol.Payload) protocol.TaskComplet
 	result := stdout.String()
 	log.Printf("[standard] task=%s done → %q", taskID, result)
 	return protocol.TaskCompletePayload{TaskID: taskID, ResultURI: result}
+}
+
+func fetchDataset(uri string) (string, error) {
+	// 1. Is it a web link?
+	if strings.HasPrefix(uri, "http://") || strings.HasPrefix(uri, "https://") {
+		resp, err := http.Get(uri)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		return string(body), err
+	}
+
+	// 2. Otherwise, assume it's a local file mapped via Docker Volumes
+	body, err := os.ReadFile(uri)
+	return string(body), err
 }

@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"io"
 	"log"
 	"net"
+	"os"
 	"time"
 
 	"github.com/akashtripathi12/brain-and-muscle/internal/protocol"
@@ -13,56 +15,92 @@ import (
 )
 
 func main() {
-	targetNode := "brain-1" // Starting guess
+	// 1. Define CLI Flags
+	scriptPath := flag.String("script", "", "Path to the FaaS file")
+	jobID := flag.String("job", "universal-job-01", "The unique Job ID")
+	chunks := flag.Int("chunks", 26, "Number of chunks")
+	lang := flag.String("lang", "js", "Language runtime (js or python)") // 🚨 NEW
 
-	// Map internal cluster IDs to your localhost exposed ports
-	topology := map[string]string{
-		"brain-1": "localhost:8081",
-		"brain-2": "localhost:8082",
-		"brain-3": "localhost:8083",
+	flag.Parse()
+
+	// Validation
+	if *scriptPath == "" {
+		log.Fatal("Usage: go run cmd/client/main.go --script <path.js> --chunks 26 [arg1 arg2 arg3...]")
 	}
 
+	// Read the physical JS file from disk
+	scriptBytes, err := os.ReadFile(*scriptPath)
+	if err != nil {
+		log.Fatalf("Failed to read script file: %v", err)
+	}
+
+	var command string
+	if *lang == "python" {
+		command = "execute_python"
+	} else {
+		command = "execute_js"
+	}
+
+	// 2. Build the Trojan Horse Args
+	// The first argument MUST be the raw script string.
+	// We then append any extra arguments passed via the terminal (e.g., the hash, length, etc.)
+	var faasArgs []string
+	faasArgs = append(faasArgs, string(scriptBytes))
+	faasArgs = append(faasArgs, flag.Args()...) // Grabs all non-flag arguments from the CLI
+
 	userPayload := map[string]interface{}{
-		"command": "process_data",
-		"args":    []string{"chunk_data"},
+		"command": command,
+		"args":    faasArgs,
 	}
 	userPayloadBytes, _ := json.Marshal(userPayload)
 
+	// 3. Assemble the SCATTER request
 	submitReq := protocol.SubmitTaskPayload{
 		QueueName:   "default",
 		Payload:     string(userPayloadBytes),
 		RequiredCPU: 1,
 		RequiredRAM: 64,
 		JobType:     "SCATTER",
-		TotalMAPs:   50,
+		TotalMAPs:   int(*chunks),
 	}
 	submitReqBytes, _ := json.Marshal(submitReq)
 
-	log.Println("Initializing Smart Client Topology Router...")
+	log.Printf("🚀 Submitting Universal Job [%s] using script [%s] across %d chunks...", *jobID, *scriptPath, *chunks)
+	submitTaskToBrain(submitReqBytes)
+	log.Println("✅ Job successfully scattered to the cluster. Awaiting Gather report...")
+}
 
-	// The Autonomous Retry Loop
-	for attempt := 1; attempt <= 5; attempt++ {
+// Network submission logic remains identical
+func submitTaskToBrain(submitReqBytes []byte) {
+	targetNode := "brain-1"
+
+	topology := map[string]string{
+		"brain-1": "localhost:8081",
+		"brain-2": "localhost:8082",
+		"brain-3": "localhost:8083",
+	}
+
+	for attempt := 1; attempt <= 3; attempt++ {
 		targetAddr := topology[targetNode]
-		log.Printf("[Attempt %d] Dialing %s at %s...", attempt, targetNode, targetAddr)
 
 		conn, err := net.DialTimeout("tcp", targetAddr, 2*time.Second)
 		if err != nil {
-			log.Printf("❌ Failed to connect to %s. Retrying in 2s...", targetNode)
-			time.Sleep(2 * time.Second)
+			log.Printf("❌ Failed to connect to %s.", targetNode)
+			targetNode = shiftTarget(targetNode)
+			time.Sleep(1 * time.Second)
 			continue
 		}
 
 		reqID := uuid.New().String()
-		frame := protocol.PackEnvelope(protocol.OpSubmitTask, "test-client", reqID, submitReqBytes)
+		frame := protocol.PackEnvelope(protocol.OpSubmitTask, "cli-client", reqID, submitReqBytes)
 		conn.Write(frame)
 
-		// 🚨 THE DEADLINE SHIELD: Physically prevents infinite hanging
 		conn.SetReadDeadline(time.Now().Add(7 * time.Second))
 
 		respHeader := make([]byte, 5)
 		if _, err := io.ReadFull(conn, respHeader); err != nil {
-			log.Printf("❌ Network timeout/error waiting for Brain: %v", err)
 			conn.Close()
+			targetNode = shiftTarget(targetNode)
 			continue
 		}
 
@@ -73,32 +111,29 @@ func main() {
 
 		_, _, _, payloadBytes, _ := protocol.UnpackEnvelope(respBody)
 
-		// Handle the response autonomously
 		if respOp == protocol.OpTaskAccepted {
-			var accepted protocol.TaskAcceptedPayload
-			json.Unmarshal(payloadBytes, &accepted)
-			log.Printf("✅ SUCCESS! Job ID: %s committed to the cluster.", accepted.TaskID)
 			conn.Close()
 			return
-
 		} else if respOp == protocol.OpRedirect {
 			var redirect protocol.RedirectPayload
 			json.Unmarshal(payloadBytes, &redirect)
-
-			if redirect.LeaderID == "" {
-				log.Println("⚠️ Cluster is electing a new Leader. Backing off 2 seconds...")
-				time.Sleep(2 * time.Second)
-			} else {
-				log.Printf("⚠️ Redirected! New Leader is: %s", redirect.LeaderID)
+			if redirect.LeaderID != "" {
 				targetNode = redirect.LeaderID
 			}
-
+			conn.Close()
 		} else {
-			log.Printf("❌ BRAIN ERROR: %s", string(payloadBytes))
+			conn.Close()
+			return
 		}
-
-		conn.Close()
 	}
+	log.Printf("🚨 FAILED to submit task after 3 attempts.")
+}
 
-	log.Fatalf("❌ FATAL: Failed to submit task after 5 attempts.")
+func shiftTarget(current string) string {
+	if current == "brain-1" {
+		return "brain-2"
+	} else if current == "brain-2" {
+		return "brain-3"
+	}
+	return "brain-1"
 }
