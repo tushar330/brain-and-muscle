@@ -38,6 +38,8 @@ const (
 	OpRaftTick             uint8 = 0x19
 	OpInstallSnapshot      uint8 = 0x1A
 	OpInstallSnapshotReply uint8 = 0x1B
+	OpServiceReady         uint8 = 0x1C
+	OpServiceReadyAck      uint8 = 0x1D
 )
 
 type Message struct {
@@ -154,22 +156,32 @@ func UnpackEnvelope(body []byte) (nodeID string, reqID string, timestamp int64, 
 	return nodeID, reqID, timestamp, payload, nil
 }
 
+const (
+	JobTypeMLPS     = "ML_PS"
+	JobTypeMLWorker = "ML_WORKER"
+)
+
 type Payload struct {
-	JobType       string   `json:"job_type"`
-	JobID         string   `json:"job_id"`
-	ChunkIndex    int      `json:"chunk_index"`
-	AttemptNumber int      `json:"attempt_number"`
-	Command       string   `json:"command"`
-	Args          []string `json:"args"`       // standard task arguments (Version A)
-	InputURIs     []string `json:"input_uris"` // MAP chunk outputs forwarded to GATHER (Version B)
+	JobType          string            `json:"job_type"`
+	JobID            string            `json:"job_id"`
+	ChunkIndex       int               `json:"chunk_index"`
+	AttemptNumber    int               `json:"attempt_number"`
+	Command          string            `json:"command"`
+	Args             []string          `json:"args"`       // standard task arguments (Version A)
+	InputURIs        []string          `json:"input_uris"` // MAP chunk outputs forwarded to GATHER (Version B)
+	TopologyMap      map[string]string `json:"topology_map,omitempty"`
+	UserScriptPath   string            `json:"user_script_path,omitempty"`
+	GatherScriptPath string            `json:"gather_script_path,omitempty"`
 }
 
 type TaskCompletePayload struct {
-	TaskID     string `json:"task_id"`
-	JobID      string `json:"job_id"`
-	JobType    string `json:"job_type"` // "MAP" | "GATHER" | "" (standard)
-	ChunkIndex int    `json:"chunk_index"`
-	ResultURI  string `json:"result_uri"`
+	TaskID           string `json:"task_id"`
+	JobID            string `json:"job_id"`
+	JobType          string `json:"job_type"` // "MAP" | "GATHER" | "" (standard)
+	ChunkIndex       int    `json:"chunk_index"`
+	ResultURI        string `json:"result_uri"`
+	UserScriptPath   string `json:"user_script_path,omitempty"`
+	GatherScriptPath string `json:"gather_script_path,omitempty"`
 }
 
 // Registration
@@ -192,12 +204,15 @@ type HeartbeatPayload struct {
 // Task submission (client → brain)
 
 type SubmitTaskPayload struct {
-	QueueName   string `json:"queue_name"`
-	Payload     string `json:"payload"`
-	RequiredCPU int    `json:"required_cpu"`
-	RequiredRAM int    `json:"required_ram"`
-	JobType     string `json:"job_type,omitempty"`
-	TotalMAPs   int    `json:"total_maps,omitempty"`
+	QueueName        string   `json:"queue_name"`
+	Payload          string   `json:"payload"`
+	RequiredCPU      int      `json:"required_cpu"`
+	RequiredRAM      int      `json:"required_ram"`
+	JobType          string   `json:"job_type,omitempty"`
+	TotalMAPs        int      `json:"total_maps,omitempty"`
+	UserScriptPath   string   `json:"user_script_path,omitempty"`
+	GatherScriptPath string   `json:"gather_script_path,omitempty"`
+	Args             []string `json:"args,omitempty"`
 }
 
 type TaskAcceptedPayload struct {
@@ -216,11 +231,19 @@ type RequestTaskPayload struct {
 // Task assignment (brain → muscle)
 
 type AssignedTask struct {
-	ID          string `json:"id"`
-	Payload     string `json:"payload"`
-	QueueName   string `json:"queue_name"`
-	RequiredCPU int    `json:"required_cpu"`
-	RequiredRAM int    `json:"required_ram"`
+	ID               string `json:"id"`
+	Payload          string `json:"payload"`
+	QueueName        string `json:"queue_name"`
+	RequiredCPU      int    `json:"required_cpu"`
+	RequiredRAM      int    `json:"required_ram"`
+	UserScriptPath   string `json:"user_script_path,omitempty"`
+	GatherScriptPath string `json:"gather_script_path,omitempty"`
+}
+
+type ServiceReadyPayload struct {
+	JobID       string `json:"job_id"`
+	ServiceRole string `json:"service_role"`
+	Address     string `json:"address"`
 }
 
 // Result / failure
@@ -245,9 +268,10 @@ type TaskStatusPayload struct {
 }
 
 type JobRegisteredPayload struct {
-	TotalMAPs  int               `json:"total_maps"`
-	GatherTask []byte            `json:"gather_task"`
-	MapTasks   []json.RawMessage `json:"map_tasks"`
+	TotalMAPs        int               `json:"total_maps"`
+	MapTasks         []json.RawMessage `json:"map_tasks"`
+	UserScriptPath   string            `json:"user_script_path,omitempty"`
+	GatherScriptPath string            `json:"gather_script_path,omitempty"`
 }
 
 type MapCompletedPayload struct {

@@ -31,9 +31,6 @@ go.work.sum
 # .idea/
 # .vscode/
 
-engine.wal
-snapshot.bin
-snapshot.tmp
 message_test.go
 raft_state.jsonl
 brain-*_engine.wal
@@ -41,7 +38,9 @@ brain-*_raft_state.jsonl
 brain-*_snapshot.bin
 reports/
 datasets/
-
-# Testing usage
-*.js
-*.py
+javascript/
+test_python.py
+train_model.py
+my_dummy_model.py
+iris.py
+train.py

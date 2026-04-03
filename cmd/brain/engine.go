@@ -100,6 +100,20 @@ func StartExecutionEngine(store *kv.KVStore, applyCh chan raft.ApplyMsg, walEngi
 
 		// ROUTE 1: DISTRIBUTED STATE TRANSITIONS (Task Completed, Failed, etc)
 		if isSync {
+			if len(msg.Command) >= 19 && string(msg.Command[:19]) == "SYNC:SERVICE_READY:" {
+
+				// Extract purely the JSON part (everything after the 19-char prefix)
+				jsonPayload := msg.Command[19:]
+
+				var readyPayload protocol.ServiceReadyPayload
+				if err := json.Unmarshal(jsonPayload, &readyPayload); err == nil {
+					handleServiceReadyEvent(store, readyPayload)
+				} else {
+					log.Printf("[engine] Failed to decode SERVICE_READY payload: %v", err)
+				}
+				continue
+			}
+
 			var walEntry wal.LogEntry
 			if err := json.Unmarshal(cleanPayload, &walEntry); err == nil && walEntry.Event != 0 {
 				log.Printf("[engine] Executing distributed State Transition (Event %v, Task %s)", walEntry.Event, walEntry.TaskID)
@@ -112,6 +126,7 @@ func StartExecutionEngine(store *kv.KVStore, applyCh chan raft.ApplyMsg, walEngi
 
 		// ROUTE 2: NEW DAG/TASK SUBMISSIONS
 		if isTask {
+			cleanPayload := msg.Command[5:]
 			var req protocol.SubmitTaskPayload
 			if err := json.Unmarshal(cleanPayload, &req); err != nil {
 				log.Printf("[engine] Failed to decode TASK payload: %v", err)
@@ -121,21 +136,40 @@ func StartExecutionEngine(store *kv.KVStore, applyCh chan raft.ApplyMsg, walEngi
 			if req.JobType == "SCATTER" && req.TotalMAPs > 1 {
 				log.Printf("[engine] Executing committed SCATTER job (Raft Index: %d)", msg.CommandIndex)
 				handleScatterJobInEngine(store, req, msg.CommandIndex)
+			} else if req.JobType == "ML_TRAIN" {
+				handleMLJobPhase1(store, req, msg.CommandIndex)
 			} else {
-				log.Printf("[engine] Executing committed Standard Task (Raft Index: %d)", msg.CommandIndex)
+				jobID := fmt.Sprintf("job-%d", msg.CommandIndex)
 
-				task := &kv.Task{
-					ID:          fmt.Sprintf("task-%d", msg.CommandIndex),
-					QueueName:   req.QueueName,
-					Payload:     req.Payload,
-					Status:      kv.StatusPending,
-					RequiredCPU: req.RequiredCPU,
-					RequiredRAM: req.RequiredRAM,
-					MaxRetries:  3,
-					CreatedAt:   time.Now(),
+				// Make sure you register the job state so Phase 2 knows about the path!
+				// Note: You can reuse RegisterMLJob for standard jobs since the struct is the same
+				store.RegisterJob(jobID, req.TotalMAPs, req.UserScriptPath, req.GatherScriptPath)
+
+				for i := 0; i < req.TotalMAPs; i++ {
+					// 1. BUILD THE JSON PAYLOAD
+					mapPayload := protocol.Payload{
+						JobType:        "MAP",
+						JobID:          jobID,
+						ChunkIndex:     i,
+						UserScriptPath: req.UserScriptPath,
+						Args:           req.Args,
+					}
+					rawMapPayload, _ := json.Marshal(mapPayload)
+
+					// 2. INJECT IT INTO THE TASK
+					task := &kv.Task{
+						ID:          fmt.Sprintf("%s-map-%d", jobID, i),
+						JobID:       jobID,
+						JobType:     "MAP",
+						QueueName:   req.QueueName,
+						Payload:     string(rawMapPayload),
+						Status:      kv.StatusPending,
+						RequiredCPU: req.RequiredCPU,
+						RequiredRAM: req.RequiredRAM,
+						MaxRetries:  3,
+					}
+					store.SetTask(task)
 				}
-				store.SetTask(task)
-				log.Printf("[engine] Standard task %s queued on %q", task.ID, task.QueueName)
 			}
 		}
 	}
@@ -155,28 +189,8 @@ func handleScatterJobInEngine(store *kv.KVStore, req protocol.SubmitTaskPayload,
 		return
 	}
 
-	// Build the GATHER task payload.
-	gatherPayloadMap := make(map[string]interface{})
-	for k, v := range userPayload {
-		gatherPayloadMap[k] = v
-	}
-	gatherPayloadMap["job_type"] = "GATHER"
-	gatherPayloadMap["job_id"] = jobID
-	gatherPayloadBytes, _ := json.Marshal(gatherPayloadMap)
-
-	gatherTask := &kv.Task{
-		ID:          fmt.Sprintf("task-%d-gather", cmdIndex),
-		JobID:       jobID,
-		QueueName:   req.QueueName,
-		Status:      kv.StatusPending,
-		RequiredCPU: req.RequiredCPU,
-		RequiredRAM: req.RequiredRAM,
-		Payload:     string(gatherPayloadBytes),
-		CreatedAt:   time.Now(),
-	}
-
 	// Register the job and gatherTask in memory.
-	store.RegisterJob(jobID, req.TotalMAPs, gatherTask)
+	store.RegisterJob(jobID, req.TotalMAPs, req.UserScriptPath, req.GatherScriptPath)
 
 	// Build and register all MAP tasks in memory.
 	for i := 0; i < req.TotalMAPs; i++ {
@@ -215,4 +229,64 @@ func handleScatterJobInEngine(store *kv.KVStore, req protocol.SubmitTaskPayload,
 
 	log.Printf("[engine] SCATTER job %s registered: %d MAP tasks + 1 GATHER task queued on %q",
 		jobID, req.TotalMAPs, req.QueueName)
+}
+
+func handleMLJobPhase1(store *kv.KVStore, req protocol.SubmitTaskPayload, cmdIndex uint64) {
+	jobID := fmt.Sprintf("job-ml-%d", cmdIndex)
+
+	// Register the Job
+	store.RegisterMLJob(jobID, req.TotalMAPs, req.UserScriptPath, req.GatherScriptPath)
+
+	// 🚨 FIX 1: Create and marshal the JSON payload for the Muscle
+	psPayload := protocol.Payload{
+		JobType:        "ML_PS",
+		JobID:          jobID,
+		UserScriptPath: req.UserScriptPath,
+	}
+	rawPsPayload, _ := json.Marshal(psPayload)
+
+	psTask := &kv.Task{
+		ID:          fmt.Sprintf("%s-ps", jobID),
+		JobID:       jobID,
+		JobType:     "ML_PS",
+		QueueName:   req.QueueName,
+		Payload:     string(rawPsPayload),
+		Status:      kv.StatusPending,
+		RequiredCPU: req.RequiredCPU,
+		RequiredRAM: req.RequiredRAM,
+		MaxRetries:  3,
+	}
+
+	store.SetTask(psTask)
+	log.Printf("[engine] Phase 1: ML_PS task queued for Job %s.", jobID)
+}
+
+func handleServiceReadyEvent(store *kv.KVStore, payload protocol.ServiceReadyPayload) {
+	jobPtr, success := store.UpdateJobTopology(payload.JobID, payload.ServiceRole, payload.Address)
+	if !success {
+		return
+	}
+
+	for i := 0; i < jobPtr.TotalMAPs; i++ {
+		workerPayload := protocol.Payload{
+			JobType:        "ML_WORKER",
+			JobID:          jobPtr.JobID,
+			ChunkIndex:     i,
+			TopologyMap:    jobPtr.TopologyMap,
+			UserScriptPath: jobPtr.UserScriptPath,
+		}
+
+		rawPayload, _ := json.Marshal(workerPayload)
+
+		workerTask := &kv.Task{
+			ID:      fmt.Sprintf("%s-worker-%d", jobPtr.JobID, i),
+			JobID:   jobPtr.JobID,
+			JobType: "ML_WORKER",
+			Payload: string(rawPayload),
+			Status:  kv.StatusPending,
+		}
+		store.SetTask(workerTask)
+	}
+
+	log.Printf("[engine] Phase 2: Topology established (%s). Spawning %d ML_WORKERs.", payload.Address, jobPtr.TotalMAPs)
 }

@@ -390,6 +390,17 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 				safePayload := append([]byte("SYNC:"), b...)
 				raftNode.Propose(safePayload)
 
+			case protocol.OpServiceReady:
+				// 1. We received the IP address callback from the Muscle!
+				// We must durably commit this to the Raft log so the Execution Engine can transition to Phase 2.
+
+				// 2. Wrap the raw JSON payload in our specific SYNC prefix
+				safePayload := append([]byte("SYNC:SERVICE_READY:"), msg.Payload...)
+				raftNode.Propose(safePayload)
+
+				// 3. Send a quick ACK to the Muscle so its connection manager doesn't timeout
+				event.Send(protocol.OpServiceReady, msg.RequestID, nil)
+
 			case protocol.OpSubmitTask:
 				safePayload := append([]byte("TASK:"), msg.Payload...)
 				index, _, isLeader := raftNode.Propose(safePayload)
@@ -435,7 +446,7 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 						b, _ := json.Marshal(entry)
 						safePayload := append([]byte("SYNC:"), b...)
 						raftNode.Propose(safePayload)
-					} else {
+					} else if dagResult.JobType == "MAP" { // 🚨 CHANGE FROM 'else' to 'else if'
 						mapPayload, _ := json.Marshal(protocol.MapCompletedPayload{
 							ChunkIndex: dagResult.ChunkIndex,
 							ResultURI:  dagResult.ResultURI,
@@ -454,6 +465,16 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 						b2, _ := json.Marshal(entryTask)
 						safe2 := append([]byte("SYNC:"), b2...)
 						raftNode.Propose(safe2)
+
+					} else {
+						// 🚨 NEW FALLBACK: Handle ML_PS and ML_WORKER gracefully
+						entry := wal.LogEntry{Event: wal.EventTaskCompleted, TaskID: envelope.TaskID, Payload: msg.Payload}
+						walEngine.Enqueue(wal.WriteRequest{
+							Entry: entry, Conn: event.Conn, OpCode: protocol.OpTaskCompleted, RequestID: msg.RequestID,
+						})
+						b, _ := json.Marshal(entry)
+						safePayload := append([]byte("SYNC:"), b...)
+						raftNode.Propose(safePayload)
 					}
 				} else {
 					entry := wal.LogEntry{Event: wal.EventTaskCompleted, TaskID: envelope.TaskID, Payload: msg.Payload}

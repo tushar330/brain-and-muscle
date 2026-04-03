@@ -24,7 +24,8 @@ const (
 )
 
 const (
-	JobRunning JobStatus = iota
+	JobProvisioning JobStatus = iota
+	JobRunning
 	JobCompleted
 	JobFailed
 )
@@ -32,6 +33,7 @@ const (
 type Task struct {
 	ID               string
 	JobID            string
+	JobType          string
 	QueueName        string
 	Payload          string
 	Result           string
@@ -55,14 +57,26 @@ type Worker struct {
 	LastHeartbeat time.Time
 }
 
+type Job struct {
+	ID           string
+	Type         string
+	Status       string
+	TotalWorkers int
+	TopologyMap  map[string]string
+}
+
 type JobMeta struct {
-	JobID       string
-	TotalMAPs   int
-	PendingMAPs int
-	FailedMAPs  int
-	GatherTask  *Task
-	Status      JobStatus
-	ResultURIs  map[int]string
+	JobID            string
+	JobType          string
+	TotalMAPs        int
+	PendingMAPs      int
+	FailedMAPs       int
+	Status           JobStatus
+	ResultURIs       map[int]string
+	TopologyMap      map[string]string
+	UserScriptPath   string
+	GatherScriptPath string
+	CompletedAt      time.Time
 }
 
 type KVStore struct {
@@ -116,9 +130,7 @@ func (kv *KVStore) ApplyReplayEvent(entry wal.LogEntry) {
 	case wal.EventJobRegistered:
 		var payload protocol.JobRegisteredPayload
 		json.Unmarshal(entry.Payload, &payload)
-		var gatherTask Task
-		json.Unmarshal(payload.GatherTask, &gatherTask)
-		kv.RegisterJob(entry.JobID, payload.TotalMAPs, &gatherTask)
+		kv.RegisterJob(entry.JobID, payload.TotalMAPs, payload.UserScriptPath, payload.GatherScriptPath)
 		for _, raw := range payload.MapTasks {
 			var mapTask Task
 			json.Unmarshal(raw, &mapTask)
@@ -291,48 +303,54 @@ func (kv *KVStore) TransitionTaskState(id string, from, to TaskStatus, workerID 
 	return nil
 }
 
-func (kv *KVStore) CompleteTask(taskID string, result string) error {
+func (kv *KVStore) CompleteTask(taskID, result string) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
+ 
 	task, ok := kv.tasks[taskID]
 	if !ok {
-		return fmt.Errorf("task %s not found", taskID)
+		return
 	}
-	if task.Status != StatusRunning {
-		return fmt.Errorf("task %s is not running (status: %v)", taskID, task.Status)
-	}
-	task.Result = result
+ 
 	task.Status = StatusCompleted
+	task.Result = result
 	task.CompletedAt = time.Now()
-	return nil
+ 
+	// 🚨 NEW: If this was a GATHER task, mark the parent Job as Completed too!
+	if task.JobType == "GATHER" && task.JobID != "" {
+		if job, ok := kv.jobs[task.JobID]; ok {
+			job.Status = JobCompleted
+			job.CompletedAt = time.Now()
+			log.Printf("[job] %s fully completed (GATHER phase finished)", task.JobID)
+		}
+	}
 }
 
 func (kv *KVStore) HandleMAPFailure(taskID, ownerWorkerID string) {
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	// REMOVED: defer kv.mu.Unlock()
 
 	task, ok := kv.tasks[taskID]
 	if !ok {
+		kv.mu.Unlock()
 		return
 	}
 
 	if ownerWorkerID != "" && task.AssignedWorkerID != ownerWorkerID {
-		log.Printf("[fail] task %s no longer owned by %s (current: %q) — skipping",
-			taskID, ownerWorkerID, task.AssignedWorkerID)
+		log.Printf("[fail] task %s no longer owned by %s (current: %q) — skipping", taskID, ownerWorkerID, task.AssignedWorkerID)
+		kv.mu.Unlock()
 		return
 	}
 
-	// Version A standalone task: fail immediately, no retry.
 	if task.JobID == "" {
 		task.Status = StatusFailed
 		task.AssignedWorkerID = ""
 		task.CompletedAt = time.Now()
 		log.Printf("[fail] standalone task %s failed (no retry)", taskID)
+		kv.mu.Unlock()
 		return
 	}
 
-	// Version B MAP task: retry up to MaxRetries.
 	task.RetryCount++
 	if task.RetryCount <= task.MaxRetries {
 		task.AttemptNumber++
@@ -340,14 +358,20 @@ func (kv *KVStore) HandleMAPFailure(taskID, ownerWorkerID string) {
 		task.AssignedWorkerID = ""
 		kv.enqueueTask(task)
 		log.Printf("[retry] task %s attempt %d/%d requeued", taskID, task.RetryCount, task.MaxRetries)
+		kv.mu.Unlock()
 		return
 	}
 
 	task.Status = StatusFailed
 	task.AssignedWorkerID = ""
 	task.CompletedAt = time.Now()
+	jobID := task.JobID // Save the ID to use outside the lock
 	log.Printf("[fail] task %s exhausted %d retries", taskID, task.MaxRetries)
-	kv.RecordMAPFailed(task.JobID)
+
+	// 🚨 FIX 2: Release the lock BEFORE calling RecordMAPFailed to prevent deadlock
+	kv.mu.Unlock()
+
+	kv.RecordMAPFailed(jobID)
 }
 
 func (kv *KVStore) GetWorkerTaskIDs(workerID string) []string {
@@ -373,17 +397,8 @@ func (kv *KVStore) SweepTerminalState(ttl time.Duration) (int, int) {
 	tasksFreed, jobsFreed := 0, 0
 
 	for id, job := range kv.jobs {
-		if job.Status == JobCompleted || job.Status == JobFailed {
-			if job.GatherTask != nil {
-				deadline := job.GatherTask.CompletedAt
-				if deadline.IsZero() {
-					deadline = job.GatherTask.CreatedAt
-				}
-				if !deadline.IsZero() && now.Sub(deadline) > ttl {
-					delete(kv.jobs, id)
-					jobsFreed++
-				}
-			} else {
+		if (job.Status == JobCompleted || job.Status == JobFailed) && !job.CompletedAt.IsZero() {
+			if now.Sub(job.CompletedAt) > ttl {
 				delete(kv.jobs, id)
 				jobsFreed++
 			}
@@ -428,21 +443,19 @@ func (kv *KVStore) enqueueTask(task *Task) {
 // Job registry (Version B)
 
 // RegisterJob creates the JobMeta and pre-stages the GATHER task.
-func (kv *KVStore) RegisterJob(jobID string, totalMAPs int, gatherTask *Task) {
+func (kv *KVStore) RegisterJob(jobID string, totalMAPs int, scriptPath string, gatherPath string) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	// Store a canonical copy in kv.tasks.
-	taskCopy := *gatherTask
-	kv.tasks[taskCopy.ID] = &taskCopy
-
 	kv.jobs[jobID] = &JobMeta{
-		JobID:       jobID,
-		GatherTask:  kv.tasks[taskCopy.ID], // points to the canonical copy above
-		TotalMAPs:   totalMAPs,
-		PendingMAPs: totalMAPs,
-		Status:      JobRunning,
-		ResultURIs:  make(map[int]string),
+		JobID:            jobID,
+		JobType:          "MAP",
+		TotalMAPs:        totalMAPs,
+		PendingMAPs:      totalMAPs,
+		Status:           JobRunning,
+		ResultURIs:       make(map[int]string),
+		UserScriptPath:   scriptPath,
+		GatherScriptPath: gatherPath,
 	}
 }
 
@@ -460,32 +473,51 @@ func (kv *KVStore) RecordMAPComplete(jobID string, chunkIndex int, resultURI str
 
 	job.ResultURIs[chunkIndex] = resultURI
 	job.PendingMAPs--
+	log.Printf("[job] %s MAP chunk %d complete (pending: %d)", jobID, chunkIndex, job.PendingMAPs)
 
 	if job.PendingMAPs == 0 {
 		if job.FailedMAPs > 0 {
 			job.Status = JobFailed
+			job.CompletedAt = time.Now()
 			log.Printf("[job] %s failed — %d MAP(s) exhausted retries", jobID, job.FailedMAPs)
 		} else {
-			job.Status = JobCompleted
+			// Note: We don't set JobCompleted yet if we have a GATHER stage.
+			// However, if there is no GATHER, we should finish it.
+			if job.GatherScriptPath == "" {
+				job.Status = JobCompleted
+				job.CompletedAt = time.Now()
+			}
 
+			// 1. Gather all the MAP outputs
 			orderedURIs := make([]string, job.TotalMAPs)
 			for i := 0; i < job.TotalMAPs; i++ {
 				orderedURIs[i] = job.ResultURIs[i]
 			}
 
-			var payloadMap map[string]interface{}
-			if err := json.Unmarshal([]byte(job.GatherTask.Payload), &payloadMap); err != nil {
-				return fmt.Errorf("gather payload unmarshal for job %s: %w", jobID, err)
+			// 2. 🚨 DYNAMICALLY BUILD THE POLYGLOT GATHER TASK
+			gatherPayload := protocol.Payload{
+				JobType:        "GATHER",
+				JobID:          jobID,
+				InputURIs:      orderedURIs,
+				UserScriptPath: job.GatherScriptPath, // Uses the script path passed by the client!
 			}
-			payloadMap["input_uris"] = orderedURIs
-			updated, err := json.Marshal(payloadMap)
-			if err != nil {
-				return fmt.Errorf("gather payload marshal for job %s: %w", jobID, err)
-			}
-			job.GatherTask.Payload = string(updated)
+			rawGatherPayload, _ := json.Marshal(gatherPayload)
 
-			kv.enqueueTask(job.GatherTask)
-			log.Printf("[job] %s complete — enqueuing GATHER task %s", jobID, job.GatherTask.ID)
+			gatherTask := &Task{
+				ID:          fmt.Sprintf("%s-gather", jobID),
+				JobID:       jobID,
+				JobType:     "GATHER",
+				QueueName:   "default",
+				Payload:     string(rawGatherPayload),
+				Status:      StatusPending,
+				RequiredCPU: 1,
+				RequiredRAM: 512,
+			}
+
+			// 3. Inject it into the system
+			kv.tasks[gatherTask.ID] = gatherTask
+			kv.enqueueTask(gatherTask)
+			log.Printf("[job] %s complete — dynamically enqueuing GATHER task %s", jobID, gatherTask.ID)
 		}
 	}
 	return nil
@@ -504,6 +536,7 @@ func (kv *KVStore) RecordMAPFailed(jobID string) {
 	// stage (not a MAP stage). Mark the job failed without decrementing.
 	if job.PendingMAPs <= 0 {
 		job.Status = JobFailed
+		job.CompletedAt = time.Now()
 		log.Printf("[job] %s failed at GATHER stage", jobID)
 		return
 	}
@@ -513,6 +546,7 @@ func (kv *KVStore) RecordMAPFailed(jobID string) {
 
 	if job.PendingMAPs == 0 {
 		job.Status = JobFailed
+		job.CompletedAt = time.Now()
 		log.Printf("[job] %s failed — %d MAP task(s) exhausted retries", jobID, job.FailedMAPs)
 	}
 }
@@ -626,17 +660,6 @@ func (kv *KVStore) ImportSnapshot(data []byte) error {
 	kv.queues = snap.Queues
 	kv.jobs = snap.Jobs
 
-	// Re-link GatherTask pointers in JobMeta to the authoritative *Task in
-	// kv.tasks. This is necessary after JSON round-trip because json.Unmarshal
-	// allocates separate objects for the embedded GatherTask and the map entry.
-	for _, job := range kv.jobs {
-		if job.GatherTask != nil {
-			if originalTask, ok := kv.tasks[job.GatherTask.ID]; ok {
-				job.GatherTask = originalTask
-			}
-		}
-	}
-
 	for _, t := range kv.tasks {
 		if t.Status == StatusRunning && t.AssignedWorkerID != "" {
 			if _, exists := kv.workers[t.AssignedWorkerID]; !exists {
@@ -648,4 +671,35 @@ func (kv *KVStore) ImportSnapshot(data []byte) error {
 		}
 	}
 	return nil
+}
+
+func (kv *KVStore) RegisterMLJob(jobID string, totalWorkers int, scriptPath, gatherPath string) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	kv.jobs[jobID] = &JobMeta{
+		JobID:            jobID,
+		JobType:          "ML_TRAIN",
+		Status:           JobProvisioning,
+		TotalMAPs:        totalWorkers,
+		PendingMAPs:      totalWorkers,
+		ResultURIs:       make(map[int]string),
+		TopologyMap:      make(map[string]string),
+		UserScriptPath:   scriptPath,
+		GatherScriptPath: gatherPath,
+	}
+}
+
+func (kv *KVStore) UpdateJobTopology(jobID string, role string, address string) (*JobMeta, bool) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	job, exists := kv.jobs[jobID]
+	if !exists || job.Status != JobProvisioning {
+		return nil, false
+	}
+
+	job.TopologyMap[role] = address
+	job.Status = JobRunning
+	return job, true
 }

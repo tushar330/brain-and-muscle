@@ -1,7 +1,6 @@
 package muscle
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,7 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -18,14 +17,6 @@ import (
 	"github.com/akashtripathi12/brain-and-muscle/internal/protocol"
 	"github.com/dop251/goja"
 )
-
-// s3Bucket is the storage bucket name. Override with S3_BUCKET env var.
-var s3Bucket = func() string {
-	if b := os.Getenv("S3_BUCKET"); b != "" {
-		return b
-	}
-	return "bucket"
-}()
 
 // ResourcePool is a custom weighted semaphore that tracks CPU and RAM.
 type ResourcePool struct {
@@ -115,10 +106,13 @@ func NewWorker(cm *ConnectionManager, totalCPU, totalRAM int) *Worker {
 	engine.Register("execute_js", &GojaRuntime{})
 
 	// Register Python Warm Pool (it boots when the worker turns on!)
-	engine.Register("execute_python", InitDockerWarmPool("python:3.10-slim", []string{"python", "-c"}))
+	engine.Register("execute_python", InitDockerWarmPool("muscle-ml-env", []string{"python", "-u"}))
 
 	// Register Node Warm Pool (it boots when the worker turns on!)
-	engine.Register("execute_node", InitDockerWarmPool("node:18-alpine", []string{"node", "-e"}))
+	engine.Register("execute_node", InitDockerWarmPool("node:18-alpine", []string{"node"}))
+
+	// Register C++ Warm Pool (it boots when the worker turns on!)
+	engine.Register("execute_cpp", InitDockerWarmPool("gcc:latest", []string{"bash", "-c"}))
 
 	return &Worker{
 		cm:        cm,
@@ -263,6 +257,13 @@ func taskResources(task protocol.AssignedTask) (cpu, ram int) {
 
 func (w *Worker) runTask(task protocol.AssignedTask, cpu, ram int) {
 	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[exec] 🚨 FATAL PANIC in task %s: %v", task.ID, r)
+			w.cm.SendRequest(protocol.OpTaskFailed, protocol.TaskFailedPayload{
+				TaskID: task.ID,
+				Reason: fmt.Sprintf("internal panic: %v", r),
+			})
+		}
 		w.semaphore.Release(cpu, ram)
 		log.Printf("[exec] released %d CPU / %d MB RAM (task %s)", cpu, ram, task.ID)
 	}()
@@ -313,34 +314,139 @@ func (w *Worker) executeAssignedTask(assigned protocol.AssignedTask) protocol.Ta
 		return protocol.TaskCompletePayload{}
 	}
 
-	// 1. Check if the client requested a supported language strategy
-	strategy, exists := w.engine.strategies[p.Command]
-	if exists {
-		if len(p.Args) < 1 {
-			log.Printf("[exec] missing script in args for command %s", p.Command)
-			return protocol.TaskCompletePayload{}
-		}
-		script := p.Args[0]
-		faasArgs := p.Args[1:]
-
-		// BLIND EXECUTION! The Engine handles everything.
-		return strategy.Execute(assigned.ID, script, faasArgs, p)
-	}
-
 	// 2. Legacy Go fallbacks
 	switch p.JobType {
-	case "MAP":
-		return executeMAPTask(assigned.ID, p)
-	case "GATHER":
-		return executeGatherTask(assigned.ID, p)
-	case "":
-		return executeStandardTask(assigned.ID, p)
+	case "ML_PS":
+		return w.routeMLParameterServer(assigned, p)
+	case "ML_WORKER":
+		return w.routeMLWorker(assigned, p)
+	case "MAP", "GATHER":
+		return w.routeGenericTask(assigned, p)
 	default:
+		log.Printf("[muscle] ❌ Unknown JobType: %s", p.JobType)
 		return protocol.TaskCompletePayload{}
 	}
 }
 
-// This spins up an isolated sandbox, injects Go's crypto speed, and runs the user's code!
+func (w *Worker) routeGenericTask(assigned protocol.AssignedTask, p protocol.Payload) protocol.TaskCompletePayload {
+	ext := filepath.Ext(p.UserScriptPath)
+
+	var strategyName string
+	var executionCommand string
+
+	switch ext {
+	case ".js":
+		strategyName = "execute_js"
+		executionCommand = p.UserScriptPath
+	case ".cjs":
+		strategyName = "execute_node"
+		executionCommand = p.UserScriptPath
+	case ".py":
+		strategyName = "execute_python"
+		executionCommand = p.UserScriptPath
+	case ".cpp":
+		strategyName = "execute_cpp"
+		// 🚨 FIX 1: Unique binary path prevents 'Text file busy' concurrency clashes!
+		binaryPath := fmt.Sprintf("/tmp/task_%s", assigned.ID)
+		executionCommand = fmt.Sprintf("g++ -O3 %s -o %s && %s ; rm -f %s", p.UserScriptPath, binaryPath, binaryPath, binaryPath)
+	default:
+		log.Printf("[muscle] ❌ Unsupported file extension: %q for script %s", ext, p.UserScriptPath)
+		return protocol.TaskCompletePayload{}
+	}
+
+	log.Printf("[muscle] Routing %s task %d to %s runtime...", p.JobType, p.ChunkIndex, strategyName)
+
+	strategy, exists := w.engine.strategies[strategyName]
+	if !exists {
+		return protocol.TaskCompletePayload{}
+	}
+
+	// 🚨 FIX 2: Properly construct the environment variables
+	inputsString := strings.Join(p.InputURIs, ",")
+	envVars := []string{
+		"JOB_TYPE=" + p.JobType,
+		"CHUNK_INDEX=" + fmt.Sprintf("%d", p.ChunkIndex),
+		"INPUT_URIS=" + inputsString,
+	}
+
+	// 🚨 FIX 3: Pass envVars into Runtime (NO MORE Blind Casting!)
+	rawResult := strategy.Execute(assigned.ID, executionCommand, []string{}, envVars, p)
+
+	// --- THE INTERCEPTOR ---
+	rawResult.JobType = p.JobType
+	rawResult.JobID = p.JobID
+	rawResult.ChunkIndex = p.ChunkIndex
+
+	if p.JobType == "MAP" {
+		marker := "Result: "
+		idx := strings.LastIndex(rawResult.ResultURI, marker)
+		if idx != -1 {
+			cleanNumber := strings.TrimSpace(rawResult.ResultURI[idx+len(marker):])
+			log.Printf("[muscle] 🧹 Cleaned output for Brain: %s", cleanNumber)
+			rawResult.ResultURI = cleanNumber
+		}
+	}
+
+	return rawResult
+}
+
+func (w *Worker) routeMLParameterServer(assigned protocol.AssignedTask, p protocol.Payload) protocol.TaskCompletePayload {
+	log.Printf("[muscle] Booting Parameter Server for Job %s...", p.JobID)
+
+	strategy, exists := w.engine.strategies["execute_python"]
+	if !exists {
+		log.Printf("[muscle] Python strategy missing!")
+		return protocol.TaskCompletePayload{}
+	}
+
+	warmPool, ok := strategy.(*DockerWarmPoolRuntime)
+	if !ok {
+		log.Printf("[muscle] execute_python is not a DockerWarmPoolRuntime")
+		return protocol.TaskCompletePayload{}
+	}
+
+	// Start the PS in the background
+	go strategy.Execute(assigned.ID, "python/ml_ps.py", []string{}, []string{}, p)
+
+	// Wait a bit for the gRPC server to bind
+	containerIP := warmPool.GetContainerIP()
+	endpointAddress := fmt.Sprintf("%s:50051", containerIP)
+	log.Printf("[muscle] Waiting for Parameter Server to bind to %s...", endpointAddress)
+	time.Sleep(3 * time.Second)
+
+	log.Printf("[muscle] Parameter Server verified running at %s", endpointAddress)
+
+	// CALLBACK: Tell the Brain the service is ready
+	w.cm.SendRequest(protocol.OpServiceReady, protocol.ServiceReadyPayload{
+		JobID:       p.JobID,
+		ServiceRole: "PS_ENDPOINT",
+		Address:     endpointAddress,
+	})
+
+	return protocol.TaskCompletePayload{
+		TaskID:    assigned.ID,
+		JobID:     p.JobID,
+		JobType:   "ML_PS",
+		ResultURI: endpointAddress,
+	}
+}
+
+func (w *Worker) routeMLWorker(assigned protocol.AssignedTask, p protocol.Payload) protocol.TaskCompletePayload {
+	log.Printf("[muscle] Booting ML Worker %d for Job %s...", p.ChunkIndex, p.JobID)
+
+	strategy, exists := w.engine.strategies["execute_python"]
+	if !exists {
+		return protocol.TaskCompletePayload{}
+	}
+
+	if _, ok := strategy.(*DockerWarmPoolRuntime); !ok {
+		return protocol.TaskCompletePayload{}
+	}
+
+	// This executes the Python script synchronously (it waits for training to finish)
+	return strategy.Execute(assigned.ID, "python/ml_worker.py", []string{}, []string{}, p)
+}
+
 // This spins up an isolated sandbox, injects Go's crypto speed, and runs the user's code!
 func executeJSTask(taskID, script string, args []string, p protocol.Payload) protocol.TaskCompletePayload {
 	vm := goja.New()
@@ -363,6 +469,21 @@ func executeJSTask(taskID, script string, args []string, p protocol.Payload) pro
 	})
 
 	vm.Set("CHUNK_INDEX", p.ChunkIndex)
+	vm.Set("JOB_ID", p.JobID)
+	vm.Set("print", func(s string) {
+		log.Printf("[js-log] %s", s)
+	})
+
+	// LOAD SCRIPT CONTENT IF IT'S A PATH
+	if strings.HasSuffix(script, ".js") {
+		resolved := resolvePath(script)
+		content, err := os.ReadFile(resolved)
+		if err == nil {
+			script = string(content)
+		} else {
+			log.Printf("[faas] Failed to read script at %s (resolved: %s): %v", script, resolved, err)
+		}
+	}
 
 	_, err := vm.RunString(script)
 	if err != nil {
@@ -406,6 +527,22 @@ func executeJSTask(taskID, script string, args []string, p protocol.Payload) pro
 func executeJSGather(taskID, script string, p protocol.Payload) protocol.TaskCompletePayload {
 	vm := goja.New()
 
+	vm.Set("JOB_ID", p.JobID)
+	vm.Set("print", func(s string) {
+		log.Printf("[js-log] [gather] %s", s)
+	})
+
+	// LOAD SCRIPT CONTENT IF IT'S A PATH
+	if strings.HasSuffix(script, ".js") {
+		resolved := resolvePath(script)
+		content, err := os.ReadFile(resolved)
+		if err == nil {
+			script = string(content)
+		} else {
+			log.Printf("[faas] Failed to read gather script at %s (resolved: %s): %v", script, resolved, err)
+		}
+	}
+
 	_, err := vm.RunString(script)
 	if err != nil {
 		log.Printf("[faas] VM compilation failed for GATHER task %s: %v", taskID, err)
@@ -436,8 +573,9 @@ func executeJSGather(taskID, script string, p protocol.Payload) protocol.TaskCom
 	// The JS script generated the report! Just save it to disk.
 	reportString := res.String()
 
-	os.MkdirAll("./reports", 0755)
-	fileName := fmt.Sprintf("./reports/%s_report.txt", p.JobID)
+	reportDir := resolvePath("/app/reports")
+	os.MkdirAll(reportDir, 0755)
+	fileName := filepath.Join(reportDir, fmt.Sprintf("%s_report.txt", p.JobID))
 	os.WriteFile(fileName, []byte(reportString), 0644)
 
 	log.Printf("[gather] ✅ UNIVERSAL REPORT EXFILTRATED -> %s", fileName)
@@ -448,130 +586,6 @@ func executeJSGather(taskID, script string, p protocol.Payload) protocol.TaskCom
 		JobType:   "GATHER",
 		ResultURI: fileName,
 	}
-}
-
-// executeMAPTask runs a single fan-out chunk and returns a deterministic,
-// attempt-scoped Claim Check URI so the Brain can distinguish retries.
-func executeMAPTask(taskID string, p protocol.Payload) protocol.TaskCompletePayload {
-	log.Printf("[map] task=%s job=%s chunk=%d attempt=%d",
-		taskID, p.JobID, p.ChunkIndex, p.AttemptNumber)
-
-	time.Sleep(2 * time.Second)
-
-	uri := fmt.Sprintf("s3://%s/%s/chunk_%d_attempt_%d.json",
-		s3Bucket, p.JobID, p.ChunkIndex, p.AttemptNumber)
-
-	log.Printf("[map] task=%s done → %s", taskID, uri)
-	return protocol.TaskCompletePayload{
-		TaskID:     taskID,
-		JobID:      p.JobID,
-		JobType:    "MAP",
-		ChunkIndex: p.ChunkIndex,
-		ResultURI:  uri,
-	}
-}
-
-// executeGatherTask sits behind the scatter/gather barrier.
-// It receives the set of MAP output URIs (Claim Checks) injected by the Brain
-// and merges them into a single final result.
-func executeGatherTask(taskID string, p protocol.Payload) protocol.TaskCompletePayload {
-	log.Printf("[gather] task=%s job=%s merging %d inputs", taskID, p.JobID, len(p.InputURIs))
-
-	var crackedPassword string
-	failedChunks := 0
-
-	// The Brain passes all 26 outputs into p.InputURIs automatically!
-	for _, data := range p.InputURIs {
-		if strings.Contains(data, "SUCCESS") {
-			// Extract the successful password
-			var result struct {
-				Password string `json:"password"`
-			}
-			json.Unmarshal([]byte(data), &result)
-			crackedPassword = result.Password
-		} else {
-			failedChunks++
-		}
-	}
-
-	// 🚨 BUILD THE BEAUTIFUL REPORT 🚨
-	report := "========================================\n"
-	report += fmt.Sprintf("  JOB REPORT: %s\n", p.JobID)
-	report += "========================================\n"
-	report += fmt.Sprintf("Total Chunks Processed : %d\n", len(p.InputURIs))
-	report += fmt.Sprintf("Failed / Empty Chunks  : %d\n\n", failedChunks)
-
-	report += "PER-CHUNK DETAILS:\n"
-	report += "----------------------------------------\n"
-
-	// alphabet is at index 2 of args (since index 0 is script and 1 is hash in faas logic)
-	// Actually, in the GATHER task, p.Args is [script, hash, alphabet, length]
-	alphabet := ""
-	if len(p.Args) >= 3 {
-		alphabet = p.Args[2]
-	}
-
-	for i, data := range p.InputURIs {
-		char := "?"
-		if i < len(alphabet) {
-			char = string(alphabet[i])
-		}
-
-		status := "FAILED"
-		if strings.Contains(data, "SUCCESS") {
-			status = "SUCCESS 🟢"
-		}
-		report += fmt.Sprintf("Chunk #%02d (Char: '%s') -> [%s]\n", i, char, status)
-	}
-	report += "----------------------------------------\n\n"
-
-	if crackedPassword != "" {
-		report += "STATUS: [SUCCESS] 🟢\n"
-		report += fmt.Sprintf("CRACKED PASSWORD: %s\n", crackedPassword)
-	} else {
-		report += "STATUS: [FAILED] 🔴\n"
-		report += "PASSWORD NOT FOUND IN SEARCH SPACE.\n"
-	}
-	report += "========================================\n"
-
-	// Write it directly to the shared Docker volume!
-	os.MkdirAll("./reports", 0755)
-	fileName := fmt.Sprintf("./reports/%s_report.txt", p.JobID)
-	os.WriteFile(fileName, []byte(report), 0644)
-
-	log.Printf("[gather] ✅ REPORT EXFILTRATED TO DISK -> %s", fileName)
-
-	return protocol.TaskCompletePayload{
-		TaskID:    taskID,
-		JobID:     p.JobID,
-		JobType:   "GATHER",
-		ResultURI: fileName,
-	}
-}
-
-// executeStandardTask handles legacy Version A tasks.
-func executeStandardTask(taskID string, p protocol.Payload) protocol.TaskCompletePayload {
-	log.Printf("[standard] task=%s command=%q args=%v", taskID, p.Command, p.Args)
-
-	if p.Command == "" {
-		log.Printf("[standard] task=%s empty command", taskID)
-		return protocol.TaskCompletePayload{} // FIX Bug 2: empty → failure path
-	}
-
-	cmd := exec.Command(p.Command, p.Args...) //nolint:gosec
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		// return empty payload so runTask sends OpTaskFailed to the Brain.
-		log.Printf("[standard] task=%s failed: %v | stderr: %s", taskID, err, stderr.String())
-		return protocol.TaskCompletePayload{}
-	}
-
-	result := stdout.String()
-	log.Printf("[standard] task=%s done → %q", taskID, result)
-	return protocol.TaskCompletePayload{TaskID: taskID, ResultURI: result}
 }
 
 func fetchDataset(uri string) (string, error) {
@@ -586,7 +600,20 @@ func fetchDataset(uri string) (string, error) {
 		return string(body), err
 	}
 
-	// 2. Otherwise, assume it's a local file mapped via Docker Volumes
-	body, err := os.ReadFile(uri)
+	// 2. Otherwise, assume it's a local file (Resolve /app/ paths for Windows hosts)
+	resolved := resolvePath(uri)
+	body, err := os.ReadFile(resolved)
 	return string(body), err
+}
+func resolvePath(path string) string {
+	if !strings.HasPrefix(path, "/app/") {
+		return path
+	}
+	cwd, _ := os.Getwd()
+	// Clean the CWD to get the project root if running from cmd/muscle
+	cwd = strings.TrimSuffix(cwd, "\\cmd\\muscle")
+	cwd = strings.TrimSuffix(cwd, "/cmd/muscle")
+
+	relPath := strings.TrimPrefix(path, "/app/")
+	return filepath.Join(cwd, filepath.FromSlash(relPath))
 }
