@@ -39,6 +39,7 @@ brain-*_snapshot.bin
 reports/
 datasets/
 javascript/
+cpp/
 test_python.py
 train_model.py
 my_dummy_model.py
