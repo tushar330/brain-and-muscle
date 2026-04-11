@@ -40,6 +40,9 @@ const (
 	OpInstallSnapshotReply uint8 = 0x1B
 	OpServiceReady         uint8 = 0x1C
 	OpServiceReadyAck      uint8 = 0x1D
+	OpKillTask             uint8 = 0x1E
+	OpKillTaskAck          uint8 = 0x1F
+	OpRestartTask          uint8 = 0x20
 )
 
 type Message struct {
@@ -159,19 +162,36 @@ func UnpackEnvelope(body []byte) (nodeID string, reqID string, timestamp int64, 
 const (
 	JobTypeMLPS     = "ML_PS"
 	JobTypeMLWorker = "ML_WORKER"
+	JobTypeService  = "SERVICE"
+	JobTypeGeneric  = "GENERIC"
 )
 
 type Payload struct {
-	JobType          string            `json:"job_type"`
-	JobID            string            `json:"job_id"`
-	ChunkIndex       int               `json:"chunk_index"`
-	AttemptNumber    int               `json:"attempt_number"`
-	Command          string            `json:"command"`
-	Args             []string          `json:"args"`       // standard task arguments (Version A)
-	InputURIs        []string          `json:"input_uris"` // MAP chunk outputs forwarded to GATHER (Version B)
-	TopologyMap      map[string]string `json:"topology_map,omitempty"`
-	UserScriptPath   string            `json:"user_script_path,omitempty"`
-	GatherScriptPath string            `json:"gather_script_path,omitempty"`
+	JobType             string            `json:"job_type"`
+	JobID               string            `json:"job_id"`
+	ChunkIndex          int               `json:"chunk_index"`
+	AttemptNumber       int               `json:"attempt_number"`
+	Command             string            `json:"command"`
+	Args                []string          `json:"args"`       // standard task arguments (Version A)
+	InputURIs           []string          `json:"input_uris"` // MAP chunk outputs forwarded to GATHER (Version B)
+	TopologyMap         map[string]string `json:"topology_map,omitempty"`
+	Env                 map[string]string `json:"env,omitempty"`
+	BuildCommand        string            `json:"build_command,omitempty"`  //  NEW (Manual build script)
+	RunCommand          string            `json:"run_command,omitempty"`    //  NEW (Manual run script)
+	RootDirectory       string            `json:"root_directory,omitempty"` //  NEW (Working directory relative to /app)
+	UserScriptPath      string            `json:"user_script_path,omitempty"`
+	GatherScriptPath    string            `json:"gather_script_path,omitempty"`
+	ExposedPort         int               `json:"exposed_port,omitempty"`
+	HostPort            int               `json:"host_port,omitempty"`
+	RequiredCPU         float64           `json:"required_cpu,omitempty"`
+	RequiredRAM         int               `json:"required_ram,omitempty"`
+	SourceType          string            `json:"source_type,omitempty"`  // "github" | "local"
+	SourceDir           string            `json:"source_dir,omitempty"`   // Host directory to bind-mount
+	ServiceRole         string            `json:"service_role,omitempty"` //  NEW: "BACKEND_API" | "PS_ENDPOINT"
+	GitRepo             string            `json:"git_repo,omitempty"`     //  NEW for Blue/Green
+	OriginalSubmitBytes string            `json:"original_submit_bytes,omitempty"`
+	ArchiveURL          string            `json:"archive_url,omitempty"`        //  NEW: For historical log recovery
+	AssignedWorkerID    string            `json:"assigned_worker_id,omitempty"` //  NEW: For persistent worker recovery
 }
 
 type TaskCompletePayload struct {
@@ -189,30 +209,54 @@ type TaskCompletePayload struct {
 // RegisterWorkerPayload is sent once when a Muscle node first connects.
 // It tells the Brain the hard limits of this node (Docker --cpus / --memory).
 type RegisterWorkerPayload struct {
-	TotalCPU int `json:"total_cpu"`
-	TotalRAM int `json:"total_ram"`
+	TotalCPU      float64        `json:"total_cpu"`
+	TotalRAM      int            `json:"total_ram"`
+	AvailCPU      float64        `json:"avail_cpu"`                 //  NEW: Availability after adoption
+	AvailRAM      int            `json:"avail_ram"`                 //  NEW
+	OccupiedPorts map[int]string `json:"occupied_ports,omitempty"`  //  NEW: Port -> JobID
+	ActiveTaskIDs []string       `json:"active_task_ids,omitempty"` //  NEW: For reconciliation
 }
 
 // Heartbeat
 
 // HeartbeatPayload carries the node's current free resources on every tick.
 type HeartbeatPayload struct {
-	AvailCPU int `json:"avail_cpu"`
-	AvailRAM int `json:"avail_ram"`
+	AvailCPU      float64        `json:"avail_cpu"`
+	AvailRAM      int            `json:"avail_ram"`
+	OccupiedPorts map[int]string `json:"occupied_ports,omitempty"`  //  NEW
+	ActiveTaskIDs []string       `json:"active_task_ids,omitempty"` //  NEW
 }
 
 // Task submission (client → brain)
 
 type SubmitTaskPayload struct {
-	QueueName        string   `json:"queue_name"`
-	Payload          string   `json:"payload"`
-	RequiredCPU      int      `json:"required_cpu"`
-	RequiredRAM      int      `json:"required_ram"`
-	JobType          string   `json:"job_type,omitempty"`
-	TotalMAPs        int      `json:"total_maps,omitempty"`
-	UserScriptPath   string   `json:"user_script_path,omitempty"`
-	GatherScriptPath string   `json:"gather_script_path,omitempty"`
-	Args             []string `json:"args,omitempty"`
+	JobID            string            `json:"job_id,omitempty"`
+	QueueName        string            `json:"queue_name"`
+	Payload          string            `json:"payload"`
+	RequiredCPU      float64           `json:"required_cpu"`
+	RequiredRAM      int               `json:"required_ram"`
+	JobType          string            `json:"job_type,omitempty"`
+	TotalMAPs        int               `json:"total_maps,omitempty"`
+	UserScriptPath   string            `json:"user_script_path,omitempty"`
+	GatherScriptPath string            `json:"gather_script_path,omitempty"`
+	Env              map[string]string `json:"env,omitempty"`
+	Args             []string          `json:"args,omitempty"`
+	ExposedPort      int               `json:"exposed_port,omitempty"`
+	SourceType       string            `json:"source_type,omitempty"` // "github" | "local"
+	BuildCommand     string            `json:"build_command,omitempty"`
+	RunCommand       string            `json:"run_command,omitempty"`
+	RootDirectory    string            `json:"root_directory,omitempty"`
+	GitRepo          string            `json:"git_repo,omitempty"`
+	ProjectID        string            `json:"project_id,omitempty"`
+	CommitHash       string            `json:"commit_hash,omitempty"`
+	BranchName       string            `json:"branch_name,omitempty"`
+	UserID           string            `json:"user_id,omitempty"` //  Multi-Tenancy ID
+}
+
+type RegisterProjectPayload struct {
+	UserID        string `json:"user_id"`
+	RepoFullName  string `json:"repo_full_name"`
+	WebhookSecret string `json:"webhook_secret"`
 }
 
 type TaskAcceptedPayload struct {
@@ -223,27 +267,34 @@ type TaskAcceptedPayload struct {
 
 // RequestTaskPayload is sent by a Muscle node when polling for work.
 type RequestTaskPayload struct {
-	QueueName string `json:"queue_name"`
-	AvailCPU  int    `json:"avail_cpu"`
-	AvailRAM  int    `json:"avail_ram"`
+	QueueName     string         `json:"queue_name"`
+	AvailCPU      float64        `json:"avail_cpu"`
+	AvailRAM      int            `json:"avail_ram"`
+	OccupiedPorts map[int]string `json:"occupied_ports,omitempty"`  //  NEW
+	ActiveTaskIDs []string       `json:"active_task_ids,omitempty"` //  NEW
 }
 
 // Task assignment (brain → muscle)
 
 type AssignedTask struct {
-	ID               string `json:"id"`
-	Payload          string `json:"payload"`
-	QueueName        string `json:"queue_name"`
-	RequiredCPU      int    `json:"required_cpu"`
-	RequiredRAM      int    `json:"required_ram"`
-	UserScriptPath   string `json:"user_script_path,omitempty"`
-	GatherScriptPath string `json:"gather_script_path,omitempty"`
+	ID               string  `json:"id"`
+	Payload          string  `json:"payload"`
+	QueueName        string  `json:"queue_name"`
+	RequiredCPU      float64 `json:"required_cpu"`
+	RequiredRAM      int     `json:"required_ram"`
+	UserScriptPath   string  `json:"user_script_path,omitempty"`
+	GatherScriptPath string  `json:"gather_script_path,omitempty"`
+	UploadURL        string  `json:"upload_url,omitempty"`
 }
 
 type ServiceReadyPayload struct {
-	JobID       string `json:"job_id"`
-	ServiceRole string `json:"service_role"`
-	Address     string `json:"address"`
+	JobID               string  `json:"job_id"`
+	ServiceRole         string  `json:"service_role"`
+	Address             string  `json:"address"`
+	WorkerID            string  `json:"worker_id,omitempty"`
+	RecoveredCPU        float64 `json:"recovered_cpu,omitempty"`
+	RecoveredRAM        int     `json:"recovered_ram,omitempty"`
+	OriginalSubmitBytes string  `json:"original_submit_bytes,omitempty"`
 }
 
 // Result / failure
@@ -272,6 +323,11 @@ type JobRegisteredPayload struct {
 	MapTasks         []json.RawMessage `json:"map_tasks"`
 	UserScriptPath   string            `json:"user_script_path,omitempty"`
 	GatherScriptPath string            `json:"gather_script_path,omitempty"`
+	BuildCommand     string            `json:"build_command,omitempty"`
+	RunCommand       string            `json:"run_command,omitempty"`
+	RootDirectory    string            `json:"root_directory,omitempty"`
+	RequiredCPU      float64           `json:"required_cpu,omitempty"`
+	RequiredRAM      int               `json:"required_ram,omitempty"`
 }
 
 type MapCompletedPayload struct {
@@ -281,6 +337,10 @@ type MapCompletedPayload struct {
 
 type RedirectPayload struct {
 	LeaderID string `json:"leader_id"`
+}
+
+type KillTaskPayload struct {
+	TaskID string `json:"task_id"`
 }
 
 // SendResponse is the single, canonical implementation for writing a framed response back to a worker connection.

@@ -31,17 +31,24 @@ go.work.sum
 # .idea/
 # .vscode/
 
+__pycache__/
+reports/
+datasets/
+javascript/
+cpp/
+VEM_Backend/
+
 message_test.go
 raft_state.jsonl
 brain-*_engine.wal
 brain-*_raft_state.jsonl
 brain-*_snapshot.bin
-reports/
-datasets/
-javascript/
-cpp/
+
 test_python.py
 train_model.py
 my_dummy_model.py
 iris.py
 train.py
+distributed_ml.py
+
+*.pem

@@ -51,7 +51,7 @@ def stream_gradient(worker_id, current_epoch, gradient_matrix):
 def main():
     chunk_index = os.environ.get("CHUNK_INDEX")
     ps_endpoint = os.environ.get("PS_ENDPOINT")
-    user_script = os.environ.get("USER_SCRIPT_PATH") # 🚨 NEW
+    user_script = os.environ.get("USER_SCRIPT_PATH") #  NEW
     
     if not chunk_index or not ps_endpoint or not user_script:
         print("[Worker] FATAL: Missing Environment Variables.")
@@ -59,7 +59,7 @@ def main():
         
     worker_id = f"worker-{chunk_index}"
     
-    # 🚨 NEW: Dynamically load the user's math
+    #  NEW: Dynamically load the user's math
     user_logic = load_user_plugin(user_script)
     
     print(f"[{worker_id}] Booted up. Connecting to PS at {ps_endpoint}...")
@@ -70,7 +70,7 @@ def main():
         for epoch in range(1, 6):
             print(f"\n[{worker_id}] --- Starting Epoch {epoch} ---")
             
-            # 🚨 THE FIX: Let the user's plugin do the math!
+            #  THE FIX: Let the user's plugin do the math!
             # We pass a dummy None for current_weights here to keep it simple, 
             # but in a real system, you'd pull the latest weights from the PS first.
             calculated_gradients = user_logic.compute_gradients(None, chunk_index, epoch)

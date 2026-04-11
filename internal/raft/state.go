@@ -98,7 +98,7 @@ func (b *BrainState) appendRaftRecord(rec RaftRecord) {
 	}
 }
 
-// PersistMeta records changes to the node's term or vote.
+// PersistMeta: Record term/vote changes.
 func (b *BrainState) PersistMeta() {
 	b.appendRaftRecord(RaftRecord{
 		Type:              "META",
@@ -109,7 +109,7 @@ func (b *BrainState) PersistMeta() {
 	})
 }
 
-// PersistAppend records a newly appended log entry.
+// PersistAppend: Record log entry.
 func (b *BrainState) PersistAppend(entry wal.LogEntry) {
 	b.appendRaftRecord(RaftRecord{
 		Type:  "APPEND",
@@ -164,10 +164,11 @@ func (b *BrainState) Restore() {
 		log.Fatalf("[raft] CRITICAL: scanner error on raft_state.jsonl: %v", err)
 	}
 
-	b.commitIndex = b.LastIncludedIndex
-	b.lastApplied = b.LastIncludedIndex
+	b.commitIndex = b.lastLogIndex()
+	b.lastApplied = b.LastIncludedIndex // Start from the snapshot base
 
-	log.Printf("[boot] Raft state restored. Resuming from Index %d", b.LastIncludedIndex)
+	log.Printf("[boot] Raft state restored. Re-applying committed entries from Index %d to %d", b.lastApplied+1, b.commitIndex)
+	b.applyCommittedEntries()
 }
 
 // physicalIndex converts a logical Raft index to a physical slice offset.
@@ -247,6 +248,12 @@ func (b *BrainState) CompactRaftState(snapshotIndex uint64) {
 	}
 
 	log.Printf("[raft] Compaction complete. Log size reduced to %d entries.", len(b.Log))
+}
+
+func (b *BrainState) IsLeader() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.State == "LEADER"
 }
 
 func NewBrainState(nodeID string, peers []string, applyCh chan ApplyMsg, engine Engine, snapPath string) *BrainState {
@@ -407,8 +414,7 @@ func (b *BrainState) resetElectionTimer() {
 	b.electionTimeout = time.Duration(ms) * time.Millisecond
 }
 
-// Propose allows the TCP layer to submit a new client task to the Raft cluster.
-// It returns false if this node is not the Leader.
+// Propose: Submit client task to Raft.
 func (b *BrainState) Propose(payload []byte) (uint64, uint64, bool) {
 	if b.State != "LEADER" {
 		return 0, 0, false

@@ -1,32 +1,37 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/akashtripathi12/brain-and-muscle/internal/db"
 	"github.com/akashtripathi12/brain-and-muscle/internal/kv"
 	"github.com/akashtripathi12/brain-and-muscle/internal/protocol"
 	"github.com/akashtripathi12/brain-and-muscle/internal/raft"
+	"github.com/akashtripathi12/brain-and-muscle/internal/storage"
 	"github.com/akashtripathi12/brain-and-muscle/internal/wal"
+	"github.com/joho/godotenv"
 )
 
 const (
-	workerTimeout   = 60 * time.Second
-	watcherInterval = 5 * time.Second
+	workerTimeout   = 120 * time.Second
+	watcherInterval = 30 * time.Second
 	maxMessageBytes = 10 * 1024 * 1024
 )
 
-// OutgoingMessage represents a thread-safe payload ready for the Egress Queue
+// OutgoingMessage: Thread-safe Egress payload.
 type OutgoingMessage struct {
 	OpCode    uint8
 	RequestID string
@@ -43,35 +48,61 @@ type BrainEvent struct {
 
 var eventInbox = make(chan BrainEvent, 10000)
 
+var (
+	connRegistryMu sync.RWMutex
+	connRegistry   = make(map[string]func(uint8, string, interface{}))
+)
+
 func main() {
-	// Identity & Topology
-	peerString := envOrDefault("PEERS", "") // e.g., "localhost:8081,localhost:8082"
+	// 1. MUST BE FIRST: Load environment variables
+	if err := godotenv.Load(); err != nil {
+		if err := godotenv.Load("../../.env"); err != nil {
+			log.Println("[boot] Warning: No .env file found, using system environment variables")
+		}
+	}
+
+	// 2. Identity & Topology
+	peerString := envOrDefault("PEERS", "")
 	var peers []string
 	if peerString != "" {
 		peers = strings.Split(peerString, ",")
 	}
-
-	// Initialize Lock-Free Store and Group Commit WAL
-	store := kv.NewKVStore()
 
 	nodeID := os.Getenv("NODE_ID")
 	if nodeID == "" {
 		log.Fatal("NODE_ID environment variable is required")
 	}
 
-	// Make sure they are prefixed!
+	// 3. Initialize Azure Blob Storage
+	azureConn := os.Getenv("AZURE_STORAGE_CONNECTION_STRING")
+	azureContainer := envOrDefault("AZURE_CONTAINER_NAME", "task-outputs")
+	if azureConn != "" {
+		if err := storage.InitBlobService(azureConn, azureContainer); err != nil {
+			log.Printf("[boot] Failed to initialize Azure Storage: %v", err)
+		} else {
+			log.Println("[boot] Azure Storage initialized successfully")
+		}
+	} else {
+		log.Println("[boot] Warning: AZURE_STORAGE_CONNECTION_STRING not set, local mode only")
+	}
+
+	// 4. Initialize Database (Supabase/Postgres) & Memory Store
+	store := kv.NewKVStore()
+	if err := db.InitDB(); err != nil {
+		log.Fatalf("[boot] Failed to initialize database: %v", err)
+	}
+
+	// 5. Initialize Lock-Free Store and Group Commit WAL
 	walFile := nodeID + "_engine.wal"
 	snapFile := nodeID + "_snapshot.bin"
 
 	walEngine, err := wal.NewGroupCommitWAL(walFile, snapFile)
 	if err != nil {
-		log.Fatalf("Failed to initialize WAL: %v", err)
+		log.Fatalf("[boot] Failed to initialize WAL: %v", err)
 	}
 
-	// Create the bridge channel
+	// 6. Initialize Raft Consensus
 	applyCh := make(chan raft.ApplyMsg, 1000)
-
-	// Initialize the singleton Raft State Machine
 	raftNode := raft.NewBrainState(nodeID, peers, applyCh, store, snapFile)
 
 	// PHASE 1a: SNAPSHOT RECOVERY
@@ -92,45 +123,62 @@ func main() {
 
 	// PHASE 2: RECONCILIATION
 	startHeartbeatWatcher()
-	startRaftHeartbeat(raftNode)
+	startRaftHeartbeat()
 	log.Println("[boot] Phase 2: Heartbeat watcher started (Ghost tasks will fail in 15s).")
 
 	// PHASE 3: OPEN FOR BUSINESS
 	go BrainProcessLoop(store, walEngine, raftNode)
-
 	go StartExecutionEngine(store, applyCh, walEngine, raftNode)
 
-	port := envOrDefault("PORT", "8080")
-	listener, err := net.Listen("tcp", ":"+port)
+	brainHost := envOrDefault("BRAIN_HOST", "0.0.0.0")
+	httpPort := envOrDefault("HTTP_PORT", "8888")
+	go StartAPIGateway(store, raftNode, brainHost, httpPort)
+
+	tcpPort := envOrDefault("PORT", "9000")
+	listener, err := net.Listen("tcp", net.JoinHostPort(brainHost, tcpPort))
 	if err != nil {
 		log.Fatalf("failed to start listener: %v", err)
 	}
-	defer listener.Close()
 
-	log.Printf("[boot] Phase 3: Brain is listening on :%s", port)
-
-	rand.Seed(time.Now().UnixNano())
-
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	// Listen for Muscle TCP connections.
 	go func() {
-		<-c
-		log.Println("\n[system] SIGTERM received. Shutting down gracefully...")
-		walEngine.Enqueue(wal.WriteRequest{
-			// Force a final flush of the WAL buffer before exit
-		})
-		time.Sleep(100 * time.Millisecond) // Give WAL a moment to flush
-		os.Exit(0)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return // listener was closed (graceful shutdown)
+			}
+			go handleConnection(conn)
+		}
 	}()
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("failed to accept connection: %v", err)
-			continue
-		}
-		go handleConnection(conn)
+	log.Printf("[boot] Phase 3: Brain is listening on %s:%s (Control Plane & TCP)", brainHost, tcpPort)
+
+	// PHASE 4: GRACEFUL SHUTDOWN
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	// Block here until a termination signal is received
+	<-c
+
+	log.Println("\n[system] SIGTERM received. Shutting down gracefully...")
+
+	// 1. Stop accepting new TCP connections
+	listener.Close()
+
+	// 2. Safely flush and close the Write-Ahead Log
+	if err := walEngine.Close(); err != nil {
+		log.Printf("[system] Error closing WAL: %v", err)
+	} else {
+		log.Println("[system] WAL successfully flushed and closed.")
 	}
+
+	// 3. Close Database connection pool
+	if db.Pool != nil {
+		db.Pool.Close()
+		log.Println("[system] Database connections closed.")
+	}
+
+	log.Println("[system] Brain node shut down cleanly.")
 }
 
 // handleConnection safely routes TCP ingress and implements the Actor Egress Pattern
@@ -141,7 +189,7 @@ func handleConnection(conn net.Conn) {
 	egressQueue := make(chan OutgoingMessage, 100)
 	closeSignal := make(chan struct{})
 
-	// 🚨 THE EGRESS GOROUTINE 🚨
+	//  THE EGRESS GOROUTINE
 	// This is the ONLY thread allowed to write to `conn`.
 	// This eliminates all TOCTOU panics during Raft elections.
 	go func() {
@@ -264,6 +312,12 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 					RequestID: reqID,
 					Payload:   payloadBytes,
 				}
+
+				if msg.NodeID != "" && event.Send != nil {
+					connRegistryMu.Lock()
+					connRegistry[msg.NodeID] = event.Send
+					connRegistryMu.Unlock()
+				}
 			}
 
 			// --- THE GHOST LEADER GATE ---
@@ -302,13 +356,29 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 			case protocol.OpRegisterWorker:
 				var req protocol.RegisterWorkerPayload
 				json.Unmarshal(msg.Payload, &req)
-				store.RegisterWorker(msg.NodeID, req.TotalCPU, req.TotalRAM)
+
+				//  NEW: Capture Worker IP
+				workerIP, _, _ := net.SplitHostPort(event.Conn.RemoteAddr().String())
+				if workerIP == "" || workerIP == "::1" {
+					workerIP = "127.0.0.1"
+				}
+
+				store.RegisterWorker(msg.NodeID, workerIP, req.TotalCPU, req.TotalRAM, req.AvailCPU, req.AvailRAM, req.OccupiedPorts, req.ActiveTaskIDs)
+				store.ReconcileOccupiedState(msg.NodeID, req.OccupiedPorts)
 				event.Send(protocol.OpWorkerRegistered, msg.RequestID, nil)
 
 			case protocol.OpHeartbeat:
 				var hb protocol.HeartbeatPayload
 				json.Unmarshal(msg.Payload, &hb)
-				store.UpdateWorkerHeartbeat(msg.NodeID, hb.AvailCPU, hb.AvailRAM)
+
+				//  NEW: Capture Worker IP
+				workerIP, _, _ := net.SplitHostPort(event.Conn.RemoteAddr().String())
+				if workerIP == "" || workerIP == "::1" {
+					workerIP = "127.0.0.1"
+				}
+
+				store.UpdateWorkerHeartbeat(msg.NodeID, workerIP, hb.AvailCPU, hb.AvailRAM, hb.OccupiedPorts, hb.ActiveTaskIDs)
+				store.ReconcileOccupiedState(msg.NodeID, hb.OccupiedPorts)
 				event.Send(protocol.OpHeartbeatAck, msg.RequestID, nil)
 
 			case protocol.OpGetTaskStatus:
@@ -360,29 +430,89 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 				var req protocol.RequestTaskPayload
 				json.Unmarshal(msg.Payload, &req)
 
-				store.UpdateWorkerHeartbeat(msg.NodeID, req.AvailCPU, req.AvailRAM)
+				//  NEW: Capture Worker IP
+				workerIP, _, _ := net.SplitHostPort(event.Conn.RemoteAddr().String())
+				if workerIP == "" || workerIP == "::1" {
+					workerIP = "127.0.0.1"
+				}
+
+				store.UpdateWorkerHeartbeat(msg.NodeID, workerIP, req.AvailCPU, req.AvailRAM, req.OccupiedPorts, req.ActiveTaskIDs)
+				store.ReconcileOccupiedState(msg.NodeID, req.OccupiedPorts)
 
 				if req.QueueName == "" {
 					req.QueueName = "default"
 				}
 
-				task, ok := store.PopBestFitTask(req.QueueName, req.AvailCPU, req.AvailRAM)
-				if !ok {
-					event.Send(protocol.OpNoTasksAvailable, msg.RequestID, nil)
+				dbTask, dbErr := db.CheckoutNextTask(context.Background(), req.AvailCPU, req.AvailRAM, msg.NodeID)
+				if dbErr != nil {
+					// HYBRID DISPATCHER FALLBACK: If no Postgres tasks, try the Memory Queue (Raft)!
+					memTask, exists := store.PopBestFitTask(msg.NodeID, req.AvailCPU, req.AvailRAM, req.OccupiedPorts)
+					if !exists {
+						event.Send(protocol.OpNoTasksAvailable, msg.RequestID, nil)
+						continue
+					}
+
+					log.Printf("[Dispatcher] Task %s checked out from Memory (Hybrid Fallback)", memTask.ID)
+
+					// Process Memory Task
+					var p protocol.Payload
+					json.Unmarshal([]byte(memTask.Payload), &p)
+
+					entry := wal.LogEntry{Event: wal.EventTaskDispatched, TaskID: memTask.ID, WorkerID: msg.NodeID}
+					// Inject UploadURL for Memory Path tasks too!
+					uploadURL, _ := storage.GenerateWriteSAS(memTask.ID)
+
+					walEngine.Enqueue(wal.WriteRequest{
+						Entry: entry, Conn: event.Conn, OpCode: protocol.OpTaskAssigned, RequestID: msg.RequestID,
+						Payload: protocol.AssignedTask{
+							ID:          memTask.ID,
+							Payload:     memTask.Payload,
+							UploadURL:   uploadURL,
+							RequiredCPU: memTask.RequiredCPU,
+							RequiredRAM: memTask.RequiredRAM,
+						},
+					})
+
+					b, _ := json.Marshal(entry)
+					safePayload := append([]byte("SYNC:"), b...)
+					raftNode.Propose(safePayload)
 					continue
 				}
 
-				store.TransitionTaskState(task.ID, kv.StatusPending, kv.StatusRunning, msg.NodeID)
+				// --- POSTGRES BATCH TASK PATH (Priority 1) ---
+				log.Printf("[Dispatcher] Task %s checked out from Postgres", dbTask.ID)
 
-				entry := wal.LogEntry{Event: wal.EventTaskDispatched, TaskID: task.ID, WorkerID: msg.NodeID}
+				// Update our in-memory state for UI/Raft purposes
+				store.TransitionTaskState(dbTask.ID, kv.StatusPending, kv.StatusRunning, msg.NodeID)
+
+				//  INJECT THE DATABASE UUID INTO THE RAW PAYLOAD
+				// Because the frontend only submitted a generic SubmitTaskPayload to Postgres,
+				// it lacked the Postgres-generated UUID. If we don't inject it here, the Muscle
+				// worker pulls an empty JobID and routes all logs to `/logs ""` instead of `/logs <uuid>`.
+				var parsedPayload map[string]interface{}
+				json.Unmarshal(dbTask.Payload, &parsedPayload)
+				parsedPayload["job_id"] = dbTask.ID
+				updatedPayloadBytes, _ := json.Marshal(parsedPayload)
+
+				entry := wal.LogEntry{Event: wal.EventTaskDispatched, TaskID: dbTask.ID, WorkerID: msg.NodeID}
+
+				// Generate Azure SAS Token for the Muscle
+				uploadURL, _ := storage.GenerateWriteSAS(dbTask.ID)
+
+				reqCPU, _ := parsedPayload["required_cpu"].(float64)
+				reqRAM, _ := parsedPayload["required_ram"].(float64)
+
 				walEngine.Enqueue(wal.WriteRequest{
 					Entry:     entry,
-					Conn:      event.Conn, // WAL still gets the raw connection
+					Conn:      event.Conn,
 					OpCode:    protocol.OpTaskAssigned,
 					RequestID: msg.RequestID,
 					Payload: protocol.AssignedTask{
-						ID: task.ID, Payload: task.Payload, QueueName: task.QueueName,
-						RequiredCPU: task.RequiredCPU, RequiredRAM: task.RequiredRAM,
+						ID:          dbTask.ID,
+						Payload:     string(updatedPayloadBytes),
+						UploadURL:   uploadURL,
+						RequiredCPU: reqCPU,
+						RequiredRAM: int(reqRAM),
 					},
 				})
 
@@ -402,6 +532,27 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 				event.Send(protocol.OpServiceReady, msg.RequestID, nil)
 
 			case protocol.OpSubmitTask:
+				var envelope protocol.SubmitResultPayload
+				json.Unmarshal(msg.Payload, &envelope)
+
+				//  NEW: Mark as completed in Supabase and save the Azure Blob URL!
+				// Assuming the Muscle sends the BlobURL inside the ResultPayload
+				// You may need to parse it, or pass it explicitly in the envelope.
+				dbErr := db.CompleteTask(context.Background(), envelope.TaskID, envelope.ResultPayload)
+				if dbErr != nil {
+					log.Printf("[db] ⚠️ Failed to update Supabase for task %s: %v", envelope.TaskID, dbErr)
+				}
+
+				// ... (Keep the rest of your existing DAG/Job handling logic below) ...
+				submittedTask, _ := store.GetTask(envelope.TaskID)
+
+				maxCPU, maxRAM := store.GetMaxWorkerCapacity()
+				// Only reject if at least one worker is online to give us a baseline
+				if maxCPU > 0 && (submittedTask.RequiredCPU > maxCPU || float64(submittedTask.RequiredRAM) > float64(maxRAM)) {
+					event.Send(protocol.OpError, msg.RequestID, fmt.Sprintf("TASK_TOO_LARGE: Cluster max is %.1f CPU / %d MB RAM", maxCPU, maxRAM))
+					continue
+				}
+
 				safePayload := append([]byte("TASK:"), msg.Payload...)
 				index, _, isLeader := raftNode.Propose(safePayload)
 
@@ -431,14 +582,95 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 				var envelope protocol.SubmitResultPayload
 				json.Unmarshal(msg.Payload, &envelope)
 
+				var resultData map[string]interface{}
+				json.Unmarshal([]byte(envelope.ResultPayload), &resultData)
+
+				blobURL := ""
+				if urlVal, ok := resultData["blob_url"].(string); ok {
+					blobURL = urlVal
+				}
+
+				//  SANITY CHECK: Only sync to Postgres if we have a real Blob URL.
+				// If it's just an inline result string, we keep Postgres result_blob_url empty
+				// to avoid corrupting the download button in the frontend.
+				dbBlobURL := ""
+				if strings.HasPrefix(blobURL, "http") {
+					dbBlobURL = blobURL
+				}
+
+				dbErr := db.CompleteTask(context.Background(), envelope.TaskID, dbBlobURL)
+				if dbErr != nil {
+					log.Printf("[db] Warning: Failed to update Supabase for task %s: %v", envelope.TaskID, dbErr)
+				} else {
+					log.Printf("[db] Task %s fully completed! Blob: %s", envelope.TaskID, blobURL)
+				}
+
+				// Sync memory state with Postgres.
+				store.CompleteTask(envelope.TaskID, dbBlobURL)
+				// Automated Resource Cleanup Sweep
 				submittedTask, taskFound := store.GetTask(envelope.TaskID)
+				if taskFound && submittedTask.JobID != "" {
+					if job, ok := store.GetJob(submittedTask.JobID); ok && job.Status == kv.JobCompleted {
+						liveSiblings := store.GetJobLiveTasks(submittedTask.JobID)
+						if len(liveSiblings) > 0 {
+							log.Printf("[cleanup] 🧹 Job %s completed. Sweeping %d sibling tasks...", submittedTask.JobID, len(liveSiblings))
+							for _, sID := range liveSiblings {
+								if sID == envelope.TaskID {
+									continue // Skip self
+								}
+								// Send kill signal
+								if sTask, ok := store.GetTask(sID); ok {
+									connRegistryMu.RLock()
+									workerSend, isOnline := connRegistry[sTask.AssignedWorkerID]
+									connRegistryMu.RUnlock()
+									if isOnline {
+										log.Printf("[cleanup] 💀 Killing sibling %s on worker %s", sID, sTask.AssignedWorkerID)
+										workerSend(protocol.OpKillTask, "cleanup", protocol.KillTaskPayload{TaskID: sID})
+									}
+								}
+							}
+						}
+					}
+				}
+
 				isDAG := taskFound && submittedTask.JobID != ""
 
 				if isDAG {
 					var dagResult protocol.TaskCompletePayload
-					json.Unmarshal([]byte(envelope.ResultPayload), &dagResult)
+					if err := json.Unmarshal([]byte(envelope.ResultPayload), &dagResult); err != nil {
+						log.Printf("[actor] result payload unmarshal error for task %s: %v", envelope.TaskID, err)
+					}
 
-					if dagResult.JobType == "GATHER" {
+					//  RECOVERY: If JobType is missing (Azure mode), recover from store!
+					effectiveJobType := dagResult.JobType
+					if effectiveJobType == "" {
+						effectiveJobType = submittedTask.JobType
+					}
+
+					//  RECOVERY: If result is a JSON blob_url pointer (Claim Check), extract it!
+					effectiveResultURI := dagResult.ResultURI
+					if effectiveResultURI == "" {
+						var blobPtr struct {
+							BlobURL string `json:"blob_url"`
+						}
+						if err := json.Unmarshal([]byte(envelope.ResultPayload), &blobPtr); err == nil && blobPtr.BlobURL != "" {
+							effectiveResultURI = blobPtr.BlobURL
+						} else {
+							effectiveResultURI = envelope.ResultPayload // fallback
+						}
+					}
+
+					//  RECOVERY: Recover ChunkIndex from original task payload if missing
+					effectiveChunkIndex := dagResult.ChunkIndex
+					if dagResult.JobType == "" { // Likely Azure mode
+						var originalPayload protocol.Payload
+						if err := json.Unmarshal([]byte(submittedTask.Payload), &originalPayload); err == nil {
+							effectiveChunkIndex = originalPayload.ChunkIndex
+						}
+					}
+
+					switch effectiveJobType {
+					case "GATHER":
 						entry := wal.LogEntry{Event: wal.EventTaskCompleted, TaskID: envelope.TaskID, Payload: msg.Payload}
 						walEngine.Enqueue(wal.WriteRequest{
 							Entry: entry, Conn: event.Conn, OpCode: protocol.OpTaskCompleted, RequestID: msg.RequestID,
@@ -446,12 +678,12 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 						b, _ := json.Marshal(entry)
 						safePayload := append([]byte("SYNC:"), b...)
 						raftNode.Propose(safePayload)
-					} else if dagResult.JobType == "MAP" { // 🚨 CHANGE FROM 'else' to 'else if'
+					case "MAP":
 						mapPayload, _ := json.Marshal(protocol.MapCompletedPayload{
-							ChunkIndex: dagResult.ChunkIndex,
-							ResultURI:  dagResult.ResultURI,
+							ChunkIndex: effectiveChunkIndex,
+							ResultURI:  effectiveResultURI,
 						})
-						entryMap := wal.LogEntry{Event: wal.EventMAPCompleted, JobID: dagResult.JobID, Payload: mapPayload}
+						entryMap := wal.LogEntry{Event: wal.EventMAPCompleted, JobID: submittedTask.JobID, Payload: mapPayload}
 						entryTask := wal.LogEntry{Event: wal.EventTaskCompleted, TaskID: envelope.TaskID, Payload: msg.Payload}
 
 						walEngine.Enqueue(wal.WriteRequest{
@@ -465,9 +697,7 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 						b2, _ := json.Marshal(entryTask)
 						safe2 := append([]byte("SYNC:"), b2...)
 						raftNode.Propose(safe2)
-
-					} else {
-						// 🚨 NEW FALLBACK: Handle ML_PS and ML_WORKER gracefully
+					default:
 						entry := wal.LogEntry{Event: wal.EventTaskCompleted, TaskID: envelope.TaskID, Payload: msg.Payload}
 						walEngine.Enqueue(wal.WriteRequest{
 							Entry: entry, Conn: event.Conn, OpCode: protocol.OpTaskCompleted, RequestID: msg.RequestID,
@@ -501,6 +731,55 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 				safePayload := append([]byte("SYNC:"), b...)
 				raftNode.Propose(safePayload)
 
+			case protocol.OpKillTask:
+				var req protocol.KillTaskPayload
+				json.Unmarshal(msg.Payload, &req)
+
+				// 1. Verify the task exists and is running
+				task, ok := store.GetTask(req.TaskID)
+				if !ok {
+					event.Send(protocol.OpError, msg.RequestID, "Task not found")
+					continue
+				}
+				if task.Status != kv.StatusRunning {
+					event.Send(protocol.OpError, msg.RequestID, "Task is not running. Status: "+strconv.Itoa(int(task.Status)))
+					continue
+				}
+
+				// 2. Look up the Worker's TCP socket in our routing registry
+				connRegistryMu.RLock()
+				workerSend, isOnline := connRegistry[task.AssignedWorkerID]
+				connRegistryMu.RUnlock()
+
+				if !isOnline {
+					event.Send(protocol.OpError, msg.RequestID, "Worker "+task.AssignedWorkerID+" is currently offline")
+					continue
+				}
+
+				// 3. 🎯 ASSASSINATION ORDER: Forward the kill signal to the target Muscle!
+				workerSend(protocol.OpKillTask, msg.RequestID, req)
+
+				// 4. Tell the Client we successfully fired the missile
+				event.Send(protocol.OpTaskAccepted, msg.RequestID, "Kill signal forwarded to "+task.AssignedWorkerID)
+
+			case protocol.OpKillTaskAck:
+				// 1. The Muscle has successfully destroyed the daemon.
+				var req protocol.KillTaskPayload
+				json.Unmarshal(msg.Payload, &req)
+
+				// 2. Make it crash-fault tolerant!
+				entry := wal.LogEntry{Event: wal.EventTaskKilled, TaskID: req.TaskID}
+				walEngine.Enqueue(wal.WriteRequest{
+					Entry:     entry,
+					Conn:      event.Conn,
+					OpCode:    protocol.OpTaskCompleted, // Send a standard ACK back to the worker
+					RequestID: msg.RequestID,
+				})
+
+				b, _ := json.Marshal(entry)
+				safePayload := append([]byte("SYNC:"), b...)
+				raftNode.Propose(safePayload)
+
 			// RAFT CONSENSUS PROTOCOL
 			case protocol.OpInstallSnapshot:
 				var args raft.InstallSnapshotArgs
@@ -519,7 +798,7 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 				json.Unmarshal(msg.Payload, &args)
 				reply := raftNode.ProcessRequestVote(args)
 
-				// 🚨 Thread-Safe Write 🚨
+				//  Thread-Safe Write
 				event.Send(protocol.OpRequestVoteAck, msg.RequestID, reply)
 
 			case protocol.OpAppendEntries:
@@ -527,7 +806,7 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 				json.Unmarshal(msg.Payload, &args)
 				reply := raftNode.ProcessAppendEntries(args)
 
-				// 🚨 Thread-Safe Write 🚨
+				//  Thread-Safe Write
 				event.Send(protocol.OpAppendEntriesAck, msg.RequestID, reply)
 
 			}
@@ -545,7 +824,7 @@ func startHeartbeatWatcher() {
 	}()
 }
 
-func startRaftHeartbeat(raftNode *raft.BrainState) {
+func startRaftHeartbeat() {
 	go func() {
 		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()

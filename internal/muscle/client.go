@@ -21,7 +21,7 @@ const (
 )
 
 type ConnectionManager struct {
-	peers  []string // 🚨 THE TOPOLOGY MAP
+	peers  []string //  THE TOPOLOGY MAP
 	nodeID string
 
 	connMu sync.Mutex
@@ -33,7 +33,8 @@ type ConnectionManager struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan protocol.Message
 
-	onConnect func()
+	onConnect     func()
+	onPushMessage func(protocol.Message)
 }
 
 func NewConnectionManager(peers []string, nodeID string) *ConnectionManager {
@@ -47,6 +48,10 @@ func NewConnectionManager(peers []string, nodeID string) *ConnectionManager {
 
 func (cm *ConnectionManager) SetOnConnect(hook func()) {
 	cm.onConnect = hook
+}
+
+func (cm *ConnectionManager) SetPushHandler(handler func(protocol.Message)) {
+	cm.onPushMessage = handler
 }
 
 // Run establishes the initial connection and silently reconnects on failure.
@@ -71,7 +76,7 @@ func (cm *ConnectionManager) Run() {
 	}
 }
 
-// 🚨 THE FAST-SWEEP DIALER 🚨
+// THE FAST-SWEEP DIALER
 func (cm *ConnectionManager) connectRoundRobin() net.Conn {
 	backoff := 500 * time.Millisecond
 
@@ -177,7 +182,7 @@ func (cm *ConnectionManager) SendRequest(opCode uint8, payload interface{}) (pro
 
 			log.Printf("[connmgr] Redirected by Follower. Switching target to Leader: %s", newAddr)
 
-			// 🚨 DYNAMIC TOPOLOGY SHIFT 🚨
+			//  DYNAMIC TOPOLOGY SHIFT
 			// Move the new Leader to the very front of the peers array
 			cm.connMu.Lock()
 			newPeers := []string{newAddr}
@@ -202,6 +207,25 @@ func (cm *ConnectionManager) SendRequest(opCode uint8, payload interface{}) (pro
 		cm.pendingMu.Unlock()
 		return protocol.Message{}, fmt.Errorf("request %d (%s) timed out after %v", opCode, requestID, sendTimeout)
 	}
+}
+
+// GetActiveHost returns the hostname or IP of the Brain currently connected to.
+// This is used to inject the correct control plane address into Docker tasks.
+func (cm *ConnectionManager) GetActiveHost() string {
+	cm.connMu.Lock()
+	defer cm.connMu.Unlock()
+
+	if cm.conn == nil {
+		return "localhost"
+	}
+
+	remoteAddr := cm.conn.RemoteAddr().String()
+	// Strip the port (e.g., "1.2.3.4:9000" -> "1.2.3.4")
+	idx := strings.LastIndex(remoteAddr, ":")
+	if idx != -1 {
+		return remoteAddr[:idx]
+	}
+	return remoteAddr
 }
 
 func (cm *ConnectionManager) readLoop(conn net.Conn) {
@@ -248,7 +272,11 @@ func (cm *ConnectionManager) readLoop(conn net.Conn) {
 		if found {
 			ch <- msg
 		} else {
-			log.Printf("[readloop] no pending request for RequestID %q", msg.RequestID)
+			if cm.onPushMessage != nil {
+				go cm.onPushMessage(msg)
+			} else {
+				log.Printf("[readloop] dropped orphaned message %q (no push handler)", msg.RequestID)
+			}
 		}
 	}
 }

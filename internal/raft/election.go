@@ -30,7 +30,7 @@ func (b *BrainState) startElection() {
 
 	totalNodes := 1
 	for _, p := range b.peers {
-		if !b.isSelf(p) && p != "" { // 🚨 BUG FIXED: Ghost Quorum terminated
+		if !b.isSelf(p) && p != "" { //  BUG FIXED: Ghost Quorum terminated
 			totalNodes++
 		}
 	}
@@ -53,7 +53,7 @@ func (b *BrainState) startElection() {
 	}
 
 	for _, peer := range b.peers {
-		if !b.isSelf(peer) && peer != "" { // 🚨 BUG FIXED: Stop dialing ourselves
+		if !b.isSelf(peer) && peer != "" { //  BUG FIXED: Stop dialing ourselves
 			go func(targetPeer string) {
 				reply := b.sendRequestVoteRPC(targetPeer, args)
 				b.RaftInbox <- VoteReplyEvent{
@@ -83,14 +83,14 @@ func (b *BrainState) ProcessVoteReply(event VoteReplyEvent) {
 		b.votesReceived++
 		totalNodes := 1
 		for _, p := range b.peers {
-			if !b.isSelf(p) && p != "" { // 🚨 BUG FIXED: Ghost Quorum terminated
+			if !b.isSelf(p) && p != "" { //  BUG FIXED: Ghost Quorum terminated
 				totalNodes++
 			}
 		}
 
 		majority := (totalNodes / 2) + 1
 
-		if b.votesReceived >= majority { // 🚨 BUG FIXED: Use >= instead of ==
+		if b.votesReceived >= majority { //  BUG FIXED: Use >= instead of ==
 			b.becomeLeader()
 		}
 	}

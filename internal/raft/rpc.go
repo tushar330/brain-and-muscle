@@ -94,7 +94,7 @@ func (b *BrainState) SendInstallSnapshotRPC(peerID string, args InstallSnapshotA
 		return InstallSnapshotReply{}, err
 	}
 
-	// 🚨 Snapshots are large. Give the network 10 seconds to push the binary blob.
+	//  Snapshots are large. Give the network 10 seconds to push the binary blob.
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err = conn.Write(frame); err != nil {
 		b.dropPeerConn(peerID, conn)
@@ -145,7 +145,7 @@ func (b *BrainState) ProcessInstallSnapshot(args InstallSnapshotArgs) InstallSna
 	b.LeaderID = args.LeaderId
 	b.resetElectionTimer()
 
-	// 2. 🚨 FIX 1: Strictly Less Than 🚨
+	// 2.  FIX 1: Strictly Less Than
 	if args.LastIncludedIndex < b.LastIncludedIndex {
 		return InstallSnapshotReply{Term: b.CurrentTerm}
 	}
@@ -176,7 +176,7 @@ func (b *BrainState) ProcessInstallSnapshot(args InstallSnapshotArgs) InstallSna
 	b.commitIndex = args.LastIncludedIndex
 	b.lastApplied = args.LastIncludedIndex
 
-	// 7. 🚨 FIX 2: Manually wipe and rewrite raft_state.jsonl safely 🚨
+	// 7.  FIX 2: Manually wipe and rewrite raft_state.jsonl safely
 	if b.walFile != nil {
 		b.walFile.Close()
 	}

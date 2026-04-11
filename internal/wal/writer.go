@@ -23,6 +23,8 @@ const (
 	EventJobRegistered                   // RegisterJob: SCATTER accepted, all MAP tasks + GATHER pre-staged
 	EventMAPCompleted                    // RecordMAPComplete: one MAP chunk finished
 	EventMAPFailed                       // RecordMAPFailed: one MAP chunk exhausted all retries
+	EventTaskKilled                      // KillTask: task was killed by the Brain
+	EventServiceReady                    // ServiceReadyPayload: Service is ready and advertising
 )
 
 type LogEntry struct {
@@ -38,6 +40,7 @@ type LogEntry struct {
 
 type WriteRequest struct {
 	IsSnapshot   bool
+	IsShutdown   bool
 	SnapshotData []byte
 	Entry        LogEntry
 	Conn         net.Conn
@@ -53,6 +56,7 @@ type GroupCommitWAL struct {
 	writer   *bufio.Writer
 	walInbox chan WriteRequest
 	lsn      uint64
+	done     chan struct{}
 }
 
 func NewGroupCommitWAL(walPath string, snapPath string) (*GroupCommitWAL, error) {
@@ -67,6 +71,7 @@ func NewGroupCommitWAL(walPath string, snapPath string) (*GroupCommitWAL, error)
 		file:     file,
 		writer:   bufio.NewWriterSize(file, 4*1024*1024),
 		walInbox: make(chan WriteRequest, 10000),
+		done:     make(chan struct{}),
 	}
 
 	go w.CommitLoop()
@@ -86,13 +91,21 @@ func (w *GroupCommitWAL) CommitLoop() {
 	for {
 		select {
 		case req := <-w.walInbox:
+			if req.IsShutdown {
+				log.Println("[wal] Shutdown signal received. Flushing final batch...")
+				if len(batch) > 0 {
+					w.flushAndAck(&batch)
+				}
+				close(w.done) // Signal the Close() method that we are done
+				return        // Exit the infinite loop
+			}
 
 			if req.IsSnapshot {
 				if len(batch) > 0 {
 					w.flushAndAck(&batch)
 				}
 
-				// 🚨 Use the dynamic node-specific paths!
+				//  Use the dynamic node-specific paths!
 				tmpFile := w.snapPath + ".tmp"
 				if err := os.WriteFile(tmpFile, req.SnapshotData, 0644); err != nil {
 					log.Fatalf("[wal] CRITICAL: failed to write snapshot to %s: %v", tmpFile, err)
@@ -194,4 +207,20 @@ func (w *GroupCommitWAL) ReadAll() ([]LogEntry, error) {
 	}
 
 	return entries, scanner.Err()
+}
+
+func (w *GroupCommitWAL) Close() error {
+	w.Enqueue(WriteRequest{
+		IsShutdown: true,
+	})
+
+	<-w.done
+
+	if err := w.file.Sync(); err != nil {
+		log.Printf("[wal] Warning: failed to fsync during shutdown: %v", err)
+	}
+
+	log.Println("[wal] Disk sync complete. Safely closing WAL file.")
+
+	return w.file.Close()
 }
