@@ -32,11 +32,13 @@ go.work.sum
 # .vscode/
 
 __pycache__/
+bin/
 reports/
 datasets/
 javascript/
 cpp/
 VEM_Backend/
+.vscode/
 
 message_test.go
 raft_state.jsonl
