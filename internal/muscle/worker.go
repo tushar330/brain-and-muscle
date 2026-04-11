@@ -152,7 +152,7 @@ func NewWorker(cm *ConnectionManager, totalCPU float64, totalRAM int, appDir str
 	engine.Register("execute_node", NewDockerFreshRuntime("node:18-alpine", []string{"sh", "-c"}, []string{"8080"}, hostRoot, w.WriteJobLog, cacheRoot))
 	engine.Register("execute_go", NewDockerFreshRuntime("golang:1.25-alpine", []string{"sh", "-c"}, []string{"8080"}, hostRoot, w.WriteJobLog, cacheRoot))
 
-	//  ENSURE SHARED TMP EXISTS 
+	//  ENSURE SHARED TMP EXISTS
 	if err := os.MkdirAll(w.tempRoot, 0755); err != nil {
 		log.Printf("[worker] ⚠️ Could not create temp directory %s: %v", w.tempRoot, err)
 	}
@@ -450,7 +450,7 @@ func (w *Worker) Register() {
 
 		log.Printf("[register] registered with Brain — %.1f CPU / %d MB RAM", totalCPU, totalRAM)
 
-		//  PROACTIVE RESTORATION 
+		//  PROACTIVE RESTORATION
 		// Immediately notify the Brain about any adopted services!
 		for jobID, payload := range w.adoptedJobs {
 			log.Printf("[register] ⚡ Restoring routing for job %s at %s...", jobID, payload.Address)
@@ -902,16 +902,6 @@ if (process.env.JOB_TYPE === 'MAP') {
 		rawResult.ResultURI = cleanNumber
 	}
 
-	if p.JobType == "GATHER" {
-		// Save ResultURI to reports just like Goja did!
-		reportDir := resolvePath("/app/reports")
-		os.MkdirAll(reportDir, 0755)
-		fileName := filepath.Join(reportDir, fmt.Sprintf("%s_report.txt", p.JobID))
-		os.WriteFile(fileName, []byte(rawResult.ResultURI), 0644)
-		rawResult.ResultURI = fileName
-		log.Printf("[gather] ✅ UNIVERSAL REPORT EXFILTRATED -> %s", fileName)
-	}
-
 	return rawResult
 }
 
@@ -1239,7 +1229,7 @@ func (w *Worker) routeService(ctx context.Context, assigned protocol.AssignedTas
 	// No more local cancel creation — runTask owns the context now!
 
 	go func() {
-		//  SMART ENVIRONMENT INJECTION 
+		//  SMART ENVIRONMENT INJECTION
 		// Automatically find and load .env files from the project directory
 		projectEnvVars := w.findAndLoadDotEnvFromDir(hostDir)
 
@@ -1618,38 +1608,6 @@ func (w *Worker) handlePushMessage(msg protocol.Message) {
 	}
 }
 
-// findAndLoadDotEnv scans upwards from the script's location on the host
-// to find a .env file and return its key=value pairs for injection.
-func (w *Worker) findAndLoadDotEnv(scriptPath string) []string {
-	hostPath := resolvePath(scriptPath)
-	dir := filepath.Dir(hostPath)
-
-	log.Printf("[exec] 🔍 Sniffing for .env files starting from %s...", dir)
-
-	// Max 5 levels up to avoid infinite loops or scanning the whole drive
-	for i := 0; i < 5; i++ {
-		envFile := filepath.Join(dir, ".env")
-		if _, err := os.Stat(envFile); err == nil {
-			envs, err := godotenv.Read(envFile)
-			if err == nil {
-				var res []string
-				for k, v := range envs {
-					res = append(res, fmt.Sprintf("%s=%s", k, v))
-				}
-				log.Printf("[exec] ✅ Injecting %d variables from %s", len(res), envFile)
-				return res
-			}
-		}
-
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	return nil
-}
-
 // findAndLoadDotEnvFromDir looks for a .env file directly in the given host directory.
 func (w *Worker) findAndLoadDotEnvFromDir(dir string) []string {
 	log.Printf("[exec] 🔍 Looking for .env in %s...", dir)
@@ -1667,28 +1625,6 @@ func (w *Worker) findAndLoadDotEnvFromDir(dir string) []string {
 		}
 	}
 	return nil
-}
-
-// findGoModRoot traverses upwards from the script path inside the container
-// and checks the host's filesystem to find the directory containing 'go.mod'.
-func (w *Worker) findGoModRoot(scriptPath string) string {
-	current := path.Dir(filepath.ToSlash(scriptPath))
-
-	// Look up to 5 levels for a go.mod file
-	for i := 0; i < 5; i++ {
-		hostDir := resolvePath(current)
-		if _, err := os.Stat(filepath.Join(hostDir, "go.mod")); err == nil {
-			return current // Found the module root!
-		}
-
-		parent := path.Dir(current)
-		// Stop if we hit the container root or the /app mount point
-		if parent == current || parent == "." || parent == "/" || parent == "/app" {
-			return current
-		}
-		current = parent
-	}
-	return current
 }
 
 // copyDirectorySafely performs a deep copy of a directory while ignoring massive/platform-specific generated data
