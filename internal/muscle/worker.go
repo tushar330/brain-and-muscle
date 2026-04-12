@@ -2,6 +2,7 @@ package muscle
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/akashtripathi12/brain-and-muscle/internal/protocol"
+	"github.com/akashtripathi12/brain-and-muscle/internal/storage"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/joho/godotenv"
@@ -121,7 +123,14 @@ type Worker struct {
 // NewWorker creates a Worker with a resource pool sized to the node's actual limits.
 func NewWorker(cm *ConnectionManager, totalCPU float64, totalRAM int, appDir string) *Worker {
 	engine := NewExecutionEngine()
-	hostRoot := appDir
+
+	// HARDENING: Force absolute paths for Docker volume stability on Windows
+	absAppDir, err := filepath.Abs(appDir)
+	if err != nil {
+		log.Printf("[worker] ⚠️ Could not resolve absolute path for %s: %v. Using original.", appDir, err)
+		absAppDir = appDir
+	}
+	hostRoot := absAppDir
 
 	w := &Worker{
 		cm:            cm,
@@ -176,9 +185,15 @@ func (w *Worker) StartLogServer(port int) error {
 
 	log.Printf("[muscle] Log streaming server starting on :%d", port)
 
-	// Create the listener synchronously so we can return errors immediately
+	// Create the listener synchronously
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
+		// HARDENING: If port is busy, don't crash. Just log it.
+		// This happens if the user launches the UI while the background service is already running.
+		if strings.Contains(err.Error(), "bind") || strings.Contains(err.Error(), "address already in use") {
+			log.Printf("[muscle] ⚠️ Port :%d is already in use. Skipping log server and continuing...", port)
+			return nil
+		}
 		return err
 	}
 
@@ -619,6 +634,11 @@ func (w *Worker) runTask(task protocol.AssignedTask, cpu float64, ram int) {
 
 	log.Printf("[exec] starting task %s (payload: %s)", task.ID, task.Payload)
 
+	//  NEW: Start Cloud Native Log Sync
+	if task.LogUploadURL != "" {
+		go w.startCloudLogSync(ctx, task)
+	}
+
 	result := w.executeAssignedTask(ctx, task)
 
 	// An empty TaskID signals that execution failed (unmarshal error, unknown
@@ -684,6 +704,11 @@ func (w *Worker) runTask(task protocol.AssignedTask, cpu float64, ram int) {
 		resultPayload = fmt.Sprintf(`{"blob_url":"%s"}`, blobBaseURL)
 	}
 
+	// Ensure final log flush occurs!
+	if task.LogUploadURL != "" {
+		w.syncLogToCloud(task)
+	}
+
 	_, err = w.cm.SendRequest(protocol.OpSubmitResult, protocol.SubmitResultPayload{
 		TaskID:        task.ID,
 		ResultPayload: resultPayload,
@@ -695,6 +720,67 @@ func (w *Worker) runTask(task protocol.AssignedTask, cpu float64, ram int) {
 	}
 
 	w.semaphore.Release(cpu, ram)
+}
+
+// ☁️ syncLogToCloud reads the local job log and overwrites the Azure Blob Log
+func (w *Worker) syncLogToCloud(task protocol.AssignedTask) {
+	var p protocol.Payload
+	json.Unmarshal([]byte(task.Payload), &p)
+
+	jobIDForLog := p.JobID
+	if jobIDForLog == "" {
+		jobIDForLog = task.ID
+	}
+
+	safeJobID := filepath.Base(jobIDForLog)
+	logFile := filepath.Join(w.hostRoot, "logs", safeJobID+".txt")
+
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		return // File might not exist yet
+	}
+
+	// We append "x-ms-blob-type: BlockBlob" in UploadToAzure to overwrite it wholly
+	w.UploadLogToAzure(data, task.LogUploadURL)
+}
+
+// ☁️ UploadLogToAzure performs a direct HTTP PUT to the Azure SAS URL as text/plain
+func (w *Worker) UploadLogToAzure(outputData []byte, uploadURL string) error {
+	req, err := http.NewRequest("PUT", uploadURL, bytes.NewReader(outputData))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("x-ms-blob-type", "BlockBlob")
+	req.Header.Set("Content-Type", "text/plain")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("azure upload failed with status: %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// ☁️ startCloudLogSync periodically pushes logs to Azure
+func (w *Worker) startCloudLogSync(ctx context.Context, task protocol.AssignedTask) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// The runTask loop handles the final flush
+			return
+		case <-ticker.C:
+			w.syncLogToCloud(task)
+		}
+	}
 }
 
 // UploadToAzure performs a direct HTTP PUT to the Azure SAS URL
@@ -750,9 +836,19 @@ func (w *Worker) executeAssignedTask(ctx context.Context, assigned protocol.Assi
 
 func (w *Worker) routeGenericTask(ctx context.Context, assigned protocol.AssignedTask, p protocol.Payload) protocol.TaskCompletePayload {
 	//  FIX: Ensure the raw script is accessible inside the Docker container!
-	// Copy the script from wherever the Brain/Frontend dumped it into the Worker's hostRoot sandbox.
+	// If it's a URL (Cloud Staged), download it first.
+	// Otherwise, copy from the local path.
 	if p.UserScriptPath != "" {
-		scriptContent, err := os.ReadFile(p.UserScriptPath)
+		var scriptContent []byte
+		var err error
+
+		if strings.HasPrefix(p.UserScriptPath, "http") {
+			log.Printf("[muscle] 🌐 Downloading script from URL: %s", p.UserScriptPath)
+			scriptContent, err = storage.DownloadBlob(ctx, p.UserScriptPath)
+		} else {
+			scriptContent, err = os.ReadFile(p.UserScriptPath)
+		}
+
 		if err == nil {
 			// We must ensure the filename is unique to avoid race conditions
 			safeBase := fmt.Sprintf("%s_%s", assigned.ID, filepath.Base(p.UserScriptPath))
@@ -764,7 +860,12 @@ func (w *Worker) routeGenericTask(ctx context.Context, assigned protocol.Assigne
 		}
 	}
 
-	ext := filepath.Ext(p.UserScriptPath)
+	// Strip SAS query params before detecting extension (e.g. ".py?se=..." → ".py")
+	scriptURLForExt := p.UserScriptPath
+	if idx := strings.Index(scriptURLForExt, "?"); idx != -1 {
+		scriptURLForExt = scriptURLForExt[:idx]
+	}
+	ext := filepath.Ext(scriptURLForExt)
 
 	var strategyName string
 	var executionCommand string
@@ -938,7 +1039,16 @@ func (w *Worker) routeMLWorker(ctx context.Context, assigned protocol.AssignedTa
 
 	//  FIX: Ensure the raw script is accessible inside the Docker container sandbox!
 	if p.UserScriptPath != "" {
-		scriptContent, err := os.ReadFile(p.UserScriptPath)
+		var scriptContent []byte
+		var err error
+
+		if strings.HasPrefix(p.UserScriptPath, "http") {
+			log.Printf("[muscle] 🌐 Downloading script from URL: %s", p.UserScriptPath)
+			scriptContent, err = storage.DownloadBlob(context.Background(), p.UserScriptPath)
+		} else {
+			scriptContent, err = os.ReadFile(p.UserScriptPath)
+		}
+
 		if err == nil {
 			safeBase := fmt.Sprintf("%s_%s", assigned.ID, filepath.Base(p.UserScriptPath))
 			safeScriptPath := filepath.Join(w.tempRoot, safeBase)
@@ -1068,7 +1178,12 @@ func (w *Worker) prepareServiceSource(p *protocol.Payload) (string, string, stri
 	// Manual commands provided — use shell strategy but respect file extension OR command keywords for base image!
 	log.Printf("[source] Manual commands provided (%s). Detecting base image...", p.RunCommand)
 
-	ext := filepath.Ext(p.UserScriptPath)
+	// Strip SAS query params before detecting extension
+	scriptURLForExt := p.UserScriptPath
+	if idx := strings.Index(scriptURLForExt, "?"); idx != -1 {
+		scriptURLForExt = scriptURLForExt[:idx]
+	}
+	ext := filepath.Ext(scriptURLForExt)
 	strategyName := ""
 
 	//  HEURISTIC 1: Check the command string itself (most reliable for manual overrides)

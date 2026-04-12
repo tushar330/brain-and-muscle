@@ -4,6 +4,7 @@
 package main
 
 import (
+	_ "embed"
 	"log"
 	"os"
 	"os/exec"
@@ -11,8 +12,10 @@ import (
 
 	"github.com/getlantern/systray"
 	"github.com/kardianos/service"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+//go:embed icon.ico
 var iconBytes []byte
 
 func runDesktopUI(s service.Service, cpu float64, ram int) {
@@ -55,6 +58,13 @@ func onReady(workerID string, cpu float64, ram int, appDir, logPath string, isDa
 	}()
 
 	if !isDaemonRunning {
+		// Output exclusively to the log file so the terminal stays silent
+		log.SetOutput(&lumberjack.Logger{
+			Filename:   logPath,
+			MaxSize:    10, // MB
+			MaxBackups: 3,
+			MaxAge:     28, // days
+		})
 		log.Println("[boot] Running in Portable Mode (No background service detected).")
 		go runMuscleWorker(workerID, cpu, ram, appDir)
 	} else {

@@ -120,8 +120,8 @@ func InitDockerWarmPool(imgName string, execCmd []string, exposedPorts []string,
 		}, &container.HostConfig{
 			AutoRemove: false, //  MUST BE FALSE FOR IMMORTALITY
 			Binds: []string{
-				fmt.Sprintf("%s:/app", cwd),
-				fmt.Sprintf("%s/reports:/app/reports", cwd),
+				fmt.Sprintf("%s:/app", filepath.ToSlash(cwd)),
+				fmt.Sprintf("%s/reports:/app/reports", filepath.ToSlash(cwd)),
 			},
 			PortBindings: portMap, //  Apply host port mappings
 			RestartPolicy: container.RestartPolicy{
@@ -365,11 +365,11 @@ func (d *DockerFreshRuntime) Execute(ctx context.Context, taskID string, script 
 				Memory:   int64(p.RequiredRAM * 1024 * 1024),
 			},
 			Binds: []string{
-				fmt.Sprintf("%s:/app", mountDir),
+				fmt.Sprintf("%s:/app", filepath.ToSlash(mountDir)),
 				//  PERSISTENT CACHES
-				fmt.Sprintf("%s/go-mod:/go/pkg/mod", d.cacheRoot),
-				fmt.Sprintf("%s/node-modules:/root/.npm", d.cacheRoot),
-				fmt.Sprintf("%s/pip-cache:/root/.cache", d.cacheRoot),
+				fmt.Sprintf("%s/go-mod:/go/pkg/mod", filepath.ToSlash(d.cacheRoot)),
+				fmt.Sprintf("%s/node-modules:/root/.npm", filepath.ToSlash(d.cacheRoot)),
+				fmt.Sprintf("%s/pip-cache:/root/.cache", filepath.ToSlash(d.cacheRoot)),
 			},
 			RestartPolicy: container.RestartPolicy{
 				Name: "unless-stopped",
@@ -550,7 +550,7 @@ func (d *DockerTaskRuntime) Execute(ctx context.Context, taskID string, script s
 			Memory:   int64(p.RequiredRAM * 1024 * 1024),
 		},
 		Binds: []string{
-			fmt.Sprintf("%s:/app", mountDir),
+			fmt.Sprintf("%s:/app", filepath.ToSlash(mountDir)),
 		},
 	}, nil, nil, containerName)
 

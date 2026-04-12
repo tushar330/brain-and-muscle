@@ -12,9 +12,12 @@ import (
 func runDesktopUI(s service.Service, cpu float64, ram int) {
 	log.Println("[boot] BAM Muscle is running in HEADLESS mode. Desktop UI is disabled.")
 
-	// In headless mode, if the user tries to run interactively,
-	// we just start the worker directly on the main thread.
-	appDir := envOrDefault("BAM_APP_DIR", "brain-and-muscle-data")
+	// Align with main.go and ui_cgo.go directory logic
+	programData := "C:\\ProgramData"
+	if v := os.Getenv("ProgramData"); v != "" {
+		programData = v
+	}
+	appDir := filepath.Join(programData, "BrainAndMuscle")
 
 	workerID, _ := getPersistentID(appDir)
 

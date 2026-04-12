@@ -230,13 +230,18 @@ func (cm *ConnectionManager) GetActiveHost() string {
 
 func (cm *ConnectionManager) readLoop(conn net.Conn) {
 	for {
-		header := make([]byte, 5)
+		header := make([]byte, 9)
 		if _, err := io.ReadFull(conn, header); err != nil {
 			log.Printf("[readloop] header read error: %v — exiting", err)
 			return
 		}
 
-		bodyLen := binary.BigEndian.Uint32(header[0:4])
+		if string(header[0:4]) != protocol.MagicWord {
+			log.Printf("[readloop] invalid magic header — exiting")
+			return
+		}
+
+		bodyLen := binary.BigEndian.Uint32(header[4:8])
 		if bodyLen > maxMessageBytes {
 			log.Printf("[readloop] oversized body: %d bytes — exiting", bodyLen)
 			return
@@ -256,7 +261,7 @@ func (cm *ConnectionManager) readLoop(conn net.Conn) {
 		}
 
 		msg := protocol.Message{
-			OpCode:    header[4],
+			OpCode:    header[8],
 			NodeID:    nodeID,
 			RequestID: reqID,
 			Payload:   payloadBytes,

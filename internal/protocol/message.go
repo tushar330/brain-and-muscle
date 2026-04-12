@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const MagicWord = "BAM!" // 0x42 0x41 0x4d 0x21
+
 // OpCodes
 const (
 	OpHeartbeat            uint8 = 0x01
@@ -73,13 +75,18 @@ func PackEnvelope(opCode uint8, nodeID string, reqID string, payload []byte) []b
 	payloadLen := len(payload)
 
 	// Calculate exact buffer size to avoid slice reallocation
-	totalSize := 5 + 2 + nodeIDLen + 2 + reqIDLen + 8 + 4 + payloadLen
+	// Header format: [4 bytes Magic] [4 bytes Body Length] [1 byte OpCode]
+	totalSize := 4 + 5 + 2 + nodeIDLen + 2 + reqIDLen + 8 + 4 + payloadLen
 
 	buf := make([]byte, totalSize)
 	offset := 0
 
+	// Magic Word
+	copy(buf[offset:offset+4], MagicWord)
+	offset += 4
+
 	// Frame Header
-	bodyLength := uint32(totalSize - 5)
+	bodyLength := uint32(totalSize - 9)
 	binary.BigEndian.PutUint32(buf[offset:offset+4], bodyLength)
 	offset += 4
 
@@ -114,11 +121,11 @@ func PackEnvelope(opCode uint8, nodeID string, reqID string, payload []byte) []b
 
 // UnpackEnvelope reads the raw body (excluding the 5-byte header) and extracts the fields without using reflection.
 func UnpackEnvelope(body []byte) (nodeID string, reqID string, timestamp int64, payload []byte, err error) {
-	if len(body) < 16 { // Minimum possible size (2+0 + 2+0 + 8 + 4+0)
+	if len(body) < 16 { // min body: nodeLen(2) + reqLen(2) + time(8) + payloadLen(4)
 		return "", "", 0, nil, fmt.Errorf("body too short to unpack")
 	}
 
-	offset := 0
+	offset := 0 // Skip Magic (4) + Length (4) + OpCode (1) was handled by caller
 
 	// NodeID
 	nodeIDLen := int(binary.BigEndian.Uint16(body[offset : offset+2]))
@@ -251,6 +258,8 @@ type SubmitTaskPayload struct {
 	CommitHash       string            `json:"commit_hash,omitempty"`
 	BranchName       string            `json:"branch_name,omitempty"`
 	UserID           string            `json:"user_id,omitempty"` //  Multi-Tenancy ID
+	Code             string            `json:"code,omitempty"`    //  NEW: Raw code for cloud staging
+	Extension        string            `json:"extension,omitempty"` //  NEW: File extension for staged code
 }
 
 type RegisterProjectPayload struct {
@@ -285,6 +294,7 @@ type AssignedTask struct {
 	UserScriptPath   string  `json:"user_script_path,omitempty"`
 	GatherScriptPath string  `json:"gather_script_path,omitempty"`
 	UploadURL        string  `json:"upload_url,omitempty"`
+	LogUploadURL     string  `json:"log_upload_url,omitempty"`
 }
 
 type ServiceReadyPayload struct {

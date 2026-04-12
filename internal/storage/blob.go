@@ -15,7 +15,7 @@ import (
 )
 
 var (
-	blobClient    *service.Client
+	blobClient    *azblob.Client
 	containerName string
 	accountName   string
 	accountKey    string
@@ -24,7 +24,7 @@ var (
 // InitBlobService initializes the Azure Blob client using a connection string
 func InitBlobService(connectionString string, cName string) error {
 	var err error
-	blobClient, err = service.NewClientFromConnectionString(connectionString, nil)
+	blobClient, err = azblob.NewClientFromConnectionString(connectionString, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create blob client: %w", err)
 	}
@@ -75,20 +75,19 @@ func SetCORS() error {
 		},
 	}
 
-	_, err := blobClient.SetProperties(context.TODO(), &service.SetPropertiesOptions{
+	_, err := blobClient.ServiceClient().SetProperties(context.TODO(), &service.SetPropertiesOptions{
 		CORS: corsRules,
 	})
 	return err
 }
 
-// GenerateWriteSAS generates a URL with a write-only SAS token for a specific task output
-func GenerateWriteSAS(taskID string) (string, error) {
-	blobName := fmt.Sprintf("%s.json", taskID)
-
+// GenerateWriteSAS generates a URL with a write-only SAS for a specific blob name
+func GenerateWriteSAS(blobName string) (string, error) {
 	// Set the SAS permissions and expiry
 	permissions := sas.BlobPermissions{
 		Create: true,
 		Write:  true,
+		Add:    true,
 	}
 	expiry := time.Now().Add(2 * time.Hour)
 
@@ -159,4 +158,23 @@ func DownloadBlob(ctx context.Context, blobURL string) ([]byte, error) {
 
 	// Read the entire stream into memory
 	return io.ReadAll(resp.Body)
+}
+
+// UploadBlob uploads data to a blob and returns a secure read-only SAS URL
+func UploadBlob(ctx context.Context, blobName string, data []byte) (string, error) {
+	if blobClient == nil {
+		return "", fmt.Errorf("blob service not initialized")
+	}
+
+	_, err := blobClient.UploadBuffer(ctx, containerName, blobName, data, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to upload blob %s: %w", blobName, err)
+	}
+
+	log.Printf("[storage] Uploaded blob: %s (%d bytes)", blobName, len(data))
+
+	// Return a 24-hour read-only SAS URL
+	permissions := sas.BlobPermissions{Read: true}
+	expiry := time.Now().Add(24 * time.Hour)
+	return generateSAS(blobName, permissions, expiry)
 }

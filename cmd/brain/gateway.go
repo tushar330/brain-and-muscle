@@ -54,7 +54,7 @@ func StartAPIGateway(store *kv.KVStore, raftNode *raft.BrainState, brainHost str
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key, X-User-Identity, Authorization")
 
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusOK)
@@ -110,12 +110,16 @@ func StartAPIGateway(store *kv.KVStore, raftNode *raft.BrainState, brainHost str
 					}
 				}
 			}
-
 			// Strategy B: X-API-Key (System/Internal Identity Backup)
 			if userID == "" {
 				providedKey := r.Header.Get("X-API-Key")
 				if providedKey != "" && providedKey == apiKey {
-					userID = SystemUserID
+					explicitIdentity := r.Header.Get("X-User-Identity")
+					if explicitIdentity != "" {
+						userID = explicitIdentity
+					} else {
+						userID = SystemUserID
+					}
 				}
 			}
 
@@ -233,8 +237,8 @@ func StartAPIGateway(store *kv.KVStore, raftNode *raft.BrainState, brainHost str
 		userID := r.Context().Value(userIDKey).(string)
 		sub.UserID = userID
 
-		if sub.UserScriptPath == "" {
-			http.Error(w, "user_script_path is required", http.StatusBadRequest)
+		if sub.UserScriptPath == "" && sub.Code == "" {
+			http.Error(w, "user_script_path or code is required", http.StatusBadRequest)
 			return
 		}
 
@@ -275,12 +279,32 @@ func StartAPIGateway(store *kv.KVStore, raftNode *raft.BrainState, brainHost str
 			return
 		}
 
+		// Cloud Staging: If raw code was provided, stage it to Azure and use the URL
+		if sub.Code != "" {
+			ext := sub.Extension
+			if ext == "" {
+				ext = "txt"
+			}
+			blobName := fmt.Sprintf("scripts/%s.%s", taskID, ext)
+			log.Printf("[gateway] ☁️ Staging raw code to Azure: %s", blobName)
+
+			sasURL, err := storage.UploadBlob(r.Context(), blobName, []byte(sub.Code))
+			if err != nil {
+				log.Printf("[gateway] ❌ Cloud Staging failed: %v", err)
+				http.Error(w, "Cloud Staging failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			sub.UserScriptPath = sasURL
+			sub.Code = ""      // Clear raw code to keep Raft log small
+			sub.Extension = "" // Clear extension
+		}
+
 		// Final Raft Proposal
 		sub.JobID = taskID
 		finalPayload, _ := json.Marshal(sub)
 		safePayload := append([]byte("TASK:"), finalPayload...)
 
-		log.Printf("[gateway] Deploying Task %s for %s", taskID, userID)
+		log.Printf("[gateway] Deploying Task %s for %s (Script: %s)", taskID, userID, sub.UserScriptPath)
 		index, _, isLeader := raftNode.Propose(safePayload)
 		if !isLeader {
 			http.Error(w, "Brain is not the Leader. Please redirect to: "+raftNode.LeaderID, http.StatusTemporaryRedirect)
@@ -346,93 +370,24 @@ func StartAPIGateway(store *kv.KVStore, raftNode *raft.BrainState, brainHost str
 
 	// GET /api/logs/:jobId — Proxy to the worker's log server with chunked streaming
 	mux.HandleFunc("/api/logs/", withCORS(withIdentity(func(w http.ResponseWriter, r *http.Request) {
-		userID := r.Context().Value(userIDKey).(string)
 		jobID := strings.TrimPrefix(r.URL.Path, "/api/logs/")
 		if jobID == "" {
 			http.Error(w, "Missing jobId", http.StatusBadRequest)
 			return
 		}
 
-		job, okJob := store.GetJob(jobID)
-		task, okTask := store.GetTask(jobID)
-		var assignedWorkerID string
-		var archiveURL string
+		// 1. Generate a temporary, secure Read SAS for the log file in Azure
+		logBlobName := fmt.Sprintf("logs/%s.txt", jobID)
 
-		if okJob {
-			if userID != SystemUserID && job.UserID != userID {
-				http.Error(w, "Unauthorized: You do not own this job", http.StatusForbidden)
-				return
-			}
-			assignedWorkerID = job.AssignedWorkerID
-			if assignedWorkerID == "" {
-				for _, t := range store.GetTasksForJob(jobID) {
-					if t.AssignedWorkerID != "" {
-						assignedWorkerID = t.AssignedWorkerID
-						break
-					}
-				}
-			}
-		} else if okTask {
-			if userID != SystemUserID && task.UserID != userID {
-				http.Error(w, "Unauthorized: You do not own this task", http.StatusForbidden)
-				return
-			}
-			assignedWorkerID = task.AssignedWorkerID
-		}
-
-		//  RECOVERY: If we still don't have a worker ID, check if it was in the Postgres Payload
-		if assignedWorkerID == "" && archiveURL == "" {
-			log.Printf("[gateway] 🔍 Job %s NOT IN MEMORY. Checking Postgres for assignments...", jobID)
-			dbTask, err := db.GetTaskByID(r.Context(), jobID)
-			if err == nil {
-				var p protocol.Payload
-				json.Unmarshal(dbTask.Payload, &p)
-
-				//  THE FIX: Look for the assigned_worker_id we just started persisting
-				if p.AssignedWorkerID != "" {
-					assignedWorkerID = p.AssignedWorkerID
-					log.Printf("[gateway] 🧠 Recovered Assignment from Postgres: %s -> %s", jobID, assignedWorkerID)
-				}
-
-				if p.ArchiveURL != "" {
-					archiveURL = p.ArchiveURL
-				} else if dbTask.ResultBlobURL != nil && *dbTask.ResultBlobURL != "" {
-					archiveURL = *dbTask.ResultBlobURL
-				}
-			}
-		}
-
-		// 1. If it's in Cold Storage, download and return static content
-		if archiveURL != "" {
-			log.Printf("[gateway] ❄️  Fetching archived logs from Azure for %s", jobID)
-			data, err := storage.DownloadBlob(r.Context(), archiveURL)
-			if err == nil {
-				w.Header().Set("Content-Type", "text/plain")
-				w.Header().Set("X-Log-Source", "ColdStorage")
-				w.Write(data)
-				return
-			}
-			log.Printf("[gateway] ❌ Failed to fetch cold logs: %v", err)
-		}
-
-		// 2. If it's Running, proxy to the worker
-		if assignedWorkerID == "" {
-			http.Error(w, "Job not assigned to any worker or archived yet", http.StatusNotFound)
+		signedURL, err := storage.GenerateReadSAS(logBlobName)
+		if err != nil {
+			log.Printf("[gateway] ❌ Failed to generate log link: %v", err)
+			http.Error(w, "Failed to generate log link", http.StatusInternalServerError)
 			return
 		}
 
-		worker, ok := store.GetWorker(assignedWorkerID)
-		if !ok || worker.IP == "" {
-			http.Error(w, "Worker not found or IP unknown", http.StatusBadGateway)
-			return
-		}
-
-		targetURL, _ := url.Parse(fmt.Sprintf("http://%s:9012", worker.IP))
-		proxy := httputil.NewSingleHostReverseProxy(targetURL)
-		proxy.FlushInterval = 100 * time.Millisecond
-		r.URL.Path = "/logs/" + jobID
-
-		proxy.ServeHTTP(w, r)
+		// 2. Redirect the client directly to Azure Blob Storage
+		http.Redirect(w, r, signedURL, http.StatusTemporaryRedirect)
 	})))
 
 	// GET /api/tasks/:jobId/download — Generate a temporary SAS URL for the frontend

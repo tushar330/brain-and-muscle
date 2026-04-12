@@ -440,6 +440,10 @@ func (kv *KVStore) GetAllNodes() []Worker {
 
 	nodes := make([]Worker, 0, len(kv.workers))
 	for _, w := range kv.workers {
+		// 🛡️ SECURITY: Filter out Bot scanners and Ghost adopters that haven't registered
+		if w.TotalCPU == 0 && w.TotalRAM == 0 {
+			continue
+		}
 		nodes = append(nodes, *w)
 	}
 	return nodes
@@ -638,11 +642,7 @@ func (kv *KVStore) CompleteTask(taskID, result string) {
 
 	//  EAGER RESOURCE RELEASE: Immediately reclaim CPU/RAM in the Brain's view!
 	if task.AssignedWorkerID != "" {
-		if worker, exists := kv.workers[task.AssignedWorkerID]; exists {
-			worker.AvailCPU += task.RequiredCPU
-			worker.AvailRAM += task.RequiredRAM
-			log.Printf("[reclaim] 🔋 Recovered %.1f CPU, %d MB RAM from %s (Task %s Finished)", task.RequiredCPU, task.RequiredRAM, task.AssignedWorkerID, taskID)
-		}
+		kv.reclaimResourcesInternal(task.AssignedWorkerID, task.RequiredCPU, task.RequiredRAM)
 	}
 
 	//  NEW: If this was a GATHER task, mark the parent Job as Completed too!
@@ -746,11 +746,7 @@ func (kv *KVStore) KillTask(taskID string) {
 
 		//  EAGER RESOURCE RELEASE: Reclaim resources on Kill
 		if task.AssignedWorkerID != "" {
-			if worker, exists := kv.workers[task.AssignedWorkerID]; exists {
-				worker.AvailCPU += task.RequiredCPU
-				worker.AvailRAM += task.RequiredRAM
-				log.Printf("[reclaim] 🔋 Recovered %.1f CPU, %d MB RAM from %s (Task %s Killed)", task.RequiredCPU, task.RequiredRAM, task.AssignedWorkerID, taskID)
-			}
+			kv.reclaimResourcesInternal(task.AssignedWorkerID, task.RequiredCPU, task.RequiredRAM)
 		}
 	}
 	task.AssignedWorkerID = ""
@@ -802,11 +798,7 @@ func (kv *KVStore) HandleMAPFailure(taskID, ownerWorkerID string) {
 	if task.JobID == "" {
 		//  EAGER RESOURCE RELEASE: Standalone failure
 		if task.AssignedWorkerID != "" {
-			if worker, exists := kv.workers[task.AssignedWorkerID]; exists {
-				worker.AvailCPU += task.RequiredCPU
-				worker.AvailRAM += task.RequiredRAM
-				log.Printf("[reclaim] 🔋 Recovered %.1f CPU, %d MB RAM from %s (Task %s Failed)", task.RequiredCPU, task.RequiredRAM, task.AssignedWorkerID, taskID)
-			}
+			kv.reclaimResourcesInternal(task.AssignedWorkerID, task.RequiredCPU, task.RequiredRAM)
 		}
 
 		task.Status = StatusFailed
@@ -819,11 +811,7 @@ func (kv *KVStore) HandleMAPFailure(taskID, ownerWorkerID string) {
 
 	//  EAGER RESOURCE RELEASE: Release regardless of retry
 	if task.AssignedWorkerID != "" {
-		if worker, exists := kv.workers[task.AssignedWorkerID]; exists {
-			worker.AvailCPU += task.RequiredCPU
-			worker.AvailRAM += task.RequiredRAM
-			log.Printf("[reclaim] 🔋 Recovered %.1f CPU, %d MB RAM from %s (Task %s Retrying/Failed)", task.RequiredCPU, task.RequiredRAM, task.AssignedWorkerID, taskID)
-		}
+		kv.reclaimResourcesInternal(task.AssignedWorkerID, task.RequiredCPU, task.RequiredRAM)
 	}
 
 	task.RetryCount++
@@ -1206,6 +1194,27 @@ func (kv *KVStore) RemoveWorker(workerID string) {
 	defer kv.mu.Unlock()
 
 	delete(kv.workers, workerID)
+	log.Printf("[store] 🗑️ Worker %s purged from registry", workerID)
+}
+
+// reclaimResourcesInternal reclaims CPU/RAM without exceeding Total caps.
+// Caller MUST hold kv.mu.Lock()
+func (kv *KVStore) reclaimResourcesInternal(workerID string, cpu float64, ram int) {
+	if worker, exists := kv.workers[workerID]; exists {
+		worker.AvailCPU += cpu
+		worker.AvailRAM += ram
+
+		// Safety Guard: Never exceed physical hardware limits
+		if worker.TotalCPU > 0 && worker.AvailCPU > worker.TotalCPU {
+			worker.AvailCPU = worker.TotalCPU
+		}
+		if worker.TotalRAM > 0 && worker.AvailRAM > worker.TotalRAM {
+			worker.AvailRAM = worker.TotalRAM
+		}
+
+		log.Printf("[reclaim] 🔋 Recovered %.1f CPU, %d MB RAM from %s (Current: %.1f/%.1f)",
+			cpu, ram, workerID, worker.AvailCPU, worker.TotalCPU)
+	}
 }
 
 func (kv *KVStore) SetJobStatus(jobID string, status JobStatus) {
@@ -1255,6 +1264,8 @@ func (kv *KVStore) ImportSnapshot(data []byte) error {
 	for _, t := range kv.tasks {
 		if t.Status == StatusRunning && t.AssignedWorkerID != "" {
 			if _, exists := kv.workers[t.AssignedWorkerID]; !exists {
+				// ADOPTION SKELETON: Created silently to track a running task.
+				// TotalCPU remains 0 until the worker heartbeats/registers.
 				kv.workers[t.AssignedWorkerID] = &Worker{
 					ID:            t.AssignedWorkerID,
 					LastHeartbeat: time.Now(),

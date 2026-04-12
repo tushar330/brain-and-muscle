@@ -222,7 +222,7 @@ func handleConnection(conn net.Conn) {
 		// Only set the strict deadline for the header. If it hangs, we drop.
 		conn.SetReadDeadline(time.Now().Add(workerTimeout))
 
-		header := make([]byte, 5)
+		header := make([]byte, 9)
 		if _, err := io.ReadFull(conn, header); err != nil {
 			if err != io.EOF {
 				log.Printf("read error from %s: %v", workerAddr, err)
@@ -230,11 +230,17 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 
-		// Header cleared. Give ample time to ingest large payloads without timing out.
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		// 🛡️ SECURITY: Verify BAM! Magic Word
+		if string(header[0:4]) != protocol.MagicWord {
+			log.Printf("[security] 🚫 Dropping non-BAM connection from %s", workerAddr)
+			return
+		}
 
-		bodyLen := binary.BigEndian.Uint32(header[0:4])
-		opCode := header[4]
+		// Header cleared. Give ample time to ingest large payloads without timing out.
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+		bodyLen := binary.BigEndian.Uint32(header[4:8])
+		opCode := header[8]
 
 		if bodyLen > maxMessageBytes {
 			log.Printf("payload too large from %s", workerAddr)
@@ -460,16 +466,18 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 
 					entry := wal.LogEntry{Event: wal.EventTaskDispatched, TaskID: memTask.ID, WorkerID: msg.NodeID}
 					// Inject UploadURL for Memory Path tasks too!
-					uploadURL, _ := storage.GenerateWriteSAS(memTask.ID)
+					uploadURL, _ := storage.GenerateWriteSAS(memTask.ID + ".json")
+					logUploadURL, _ := storage.GenerateWriteSAS("logs/" + memTask.ID + ".txt")
 
 					walEngine.Enqueue(wal.WriteRequest{
 						Entry: entry, Conn: event.Conn, OpCode: protocol.OpTaskAssigned, RequestID: msg.RequestID,
 						Payload: protocol.AssignedTask{
-							ID:          memTask.ID,
-							Payload:     memTask.Payload,
-							UploadURL:   uploadURL,
-							RequiredCPU: memTask.RequiredCPU,
-							RequiredRAM: memTask.RequiredRAM,
+							ID:           memTask.ID,
+							Payload:      memTask.Payload,
+							UploadURL:    uploadURL,
+							LogUploadURL: logUploadURL,
+							RequiredCPU:  memTask.RequiredCPU,
+							RequiredRAM:  memTask.RequiredRAM,
 						},
 					})
 
@@ -497,7 +505,8 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 				entry := wal.LogEntry{Event: wal.EventTaskDispatched, TaskID: dbTask.ID, WorkerID: msg.NodeID}
 
 				// Generate Azure SAS Token for the Muscle
-				uploadURL, _ := storage.GenerateWriteSAS(dbTask.ID)
+				uploadURL, _ := storage.GenerateWriteSAS(dbTask.ID + ".json")
+				logUploadURL, _ := storage.GenerateWriteSAS("logs/" + dbTask.ID + ".txt")
 
 				reqCPU, _ := parsedPayload["required_cpu"].(float64)
 				reqRAM, _ := parsedPayload["required_ram"].(float64)
@@ -508,11 +517,12 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 					OpCode:    protocol.OpTaskAssigned,
 					RequestID: msg.RequestID,
 					Payload: protocol.AssignedTask{
-						ID:          dbTask.ID,
-						Payload:     string(updatedPayloadBytes),
-						UploadURL:   uploadURL,
-						RequiredCPU: reqCPU,
-						RequiredRAM: int(reqRAM),
+						ID:           dbTask.ID,
+						Payload:      string(updatedPayloadBytes),
+						UploadURL:    uploadURL,
+						LogUploadURL: logUploadURL,
+						RequiredCPU:  reqCPU,
+						RequiredRAM:  int(reqRAM),
 					},
 				})
 
