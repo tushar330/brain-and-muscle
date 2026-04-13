@@ -5,6 +5,8 @@ package main
 
 import (
 	"log"
+	"os"
+	"path/filepath"
 
 	"github.com/kardianos/service"
 )

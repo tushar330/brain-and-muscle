@@ -850,8 +850,12 @@ func (w *Worker) routeGenericTask(ctx context.Context, assigned protocol.Assigne
 		}
 
 		if err == nil {
-			// We must ensure the filename is unique to avoid race conditions
-			safeBase := fmt.Sprintf("%s_%s", assigned.ID, filepath.Base(p.UserScriptPath))
+			// Strip SAS query params from the filename (e.g. "script.py?se=..." → "script.py")
+			baseName := filepath.Base(p.UserScriptPath)
+			if idx := strings.Index(baseName, "?"); idx != -1 {
+				baseName = baseName[:idx]
+			}
+			safeBase := fmt.Sprintf("%s_%s", assigned.ID, baseName)
 			safeScriptPath := filepath.Join(w.tempRoot, safeBase)
 			os.WriteFile(safeScriptPath, scriptContent, 0644)
 			p.UserScriptPath = safeScriptPath
@@ -1014,7 +1018,11 @@ func (w *Worker) routeMLParameterServer(ctx context.Context, assigned protocol.A
 
 	// Force the command using absolute python path and a relative script path!
 	// Inside the container /app contains the contents of temp_scripts, so we just use the filename.
+	// Strip SAS query params before extracting basename for container commands
 	basename := filepath.Base(p.UserScriptPath)
+	if idx := strings.Index(basename, "?"); idx != -1 {
+		basename = basename[:idx]
+	}
 	p.RunCommand = "/usr/local/bin/python3 -u " + basename
 
 	//  FIX: Force the JOB_TYPE check so it runs as the PS!
@@ -1050,7 +1058,12 @@ func (w *Worker) routeMLWorker(ctx context.Context, assigned protocol.AssignedTa
 		}
 
 		if err == nil {
-			safeBase := fmt.Sprintf("%s_%s", assigned.ID, filepath.Base(p.UserScriptPath))
+			// Strip SAS query params from the filename
+			baseName := filepath.Base(p.UserScriptPath)
+			if idx := strings.Index(baseName, "?"); idx != -1 {
+				baseName = baseName[:idx]
+			}
+			safeBase := fmt.Sprintf("%s_%s", assigned.ID, baseName)
 			safeScriptPath := filepath.Join(w.tempRoot, safeBase)
 			os.WriteFile(safeScriptPath, scriptContent, 0644)
 			p.UserScriptPath = safeScriptPath
@@ -1109,7 +1122,10 @@ func (w *Worker) prepareServiceSource(p *protocol.Payload) (string, string, stri
 
 		// Legacy auto-detection if still empty
 		if sourceType == "" {
-			if strings.HasPrefix(source, "https://") || strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "git@") {
+			if strings.Contains(source, "blob.core.windows.net") {
+				// Azure Blob Storage URL — NOT a git repo!
+				sourceType = "blob"
+			} else if strings.HasPrefix(source, "https://") || strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "git@") {
 				sourceType = "github"
 			} else {
 				sourceType = "local"
@@ -1133,6 +1149,32 @@ func (w *Worker) prepareServiceSource(p *protocol.Payload) (string, string, stri
 
 		hostDir = tmpDir
 		log.Printf("[source] Cloned successfully to %s", tmpDir)
+	} else if sourceType == "blob" {
+		// Azure Blob Storage URL — download the single file into a temp directory
+		tmpDir := filepath.Join(w.tempRoot, fmt.Sprintf("bam-blob-%s-%d", p.JobID, time.Now().UnixNano()))
+		if err := os.MkdirAll(tmpDir, 0755); err != nil {
+			return "", "", "", fmt.Errorf("failed to create blob temp dir: %w", err)
+		}
+
+		// Extract filename from the URL (strip SAS query params)
+		blobBasename := path.Base(source)
+		if idx := strings.Index(blobBasename, "?"); idx != -1 {
+			blobBasename = blobBasename[:idx]
+		}
+
+		log.Printf("[source] Downloading blob script: %s -> %s/%s", source, tmpDir, blobBasename)
+		scriptContent, err := storage.DownloadBlob(context.Background(), source)
+		if err != nil {
+			return "", "", "", fmt.Errorf("blob download failed: %w", err)
+		}
+
+		scriptPath := filepath.Join(tmpDir, blobBasename)
+		if err := os.WriteFile(scriptPath, scriptContent, 0644); err != nil {
+			return "", "", "", fmt.Errorf("failed to write blob script: %w", err)
+		}
+
+		hostDir = tmpDir
+		log.Printf("[source] Blob script downloaded to %s", scriptPath)
 	} else {
 		// Local path — use directly
 		// If it's a container path (/app/...), resolve to host

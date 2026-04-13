@@ -216,8 +216,39 @@ func StartAPIGateway(store *kv.KVStore, raftNode *raft.BrainState, brainHost str
 			return
 		}
 
+		type HistoryResponse struct {
+			JobID       string    `json:"job_id"`
+			JobType     string    `json:"job_type"`
+			Status      int       `json:"status"`
+			RequiredCPU float64   `json:"required_cpu"`
+			RequiredRAM int       `json:"required_ram"`
+			CreatedAt   time.Time `json:"created_at"`
+			TotalMaps   int       `json:"total_maps,omitempty"`
+		}
+
+		var formattedHistory []HistoryResponse
+		for _, j := range history {
+			var pMap map[string]interface{}
+			json.Unmarshal([]byte(j.Payload), &pMap)
+			cpu, _ := pMap["required_cpu"].(float64)
+			ramF, _ := pMap["required_ram"].(float64)
+			mapsF, _ := pMap["total_maps"].(float64)
+			ram := int(ramF)
+			maps := int(mapsF)
+
+			formattedHistory = append(formattedHistory, HistoryResponse{
+				JobID:       j.ID,
+				JobType:     j.JobType,
+				Status:      j.Status,
+				RequiredCPU: cpu,
+				RequiredRAM: ram,
+				CreatedAt:   j.CreatedAt,
+				TotalMaps:   maps,
+			})
+		}
+
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(history)
+		json.NewEncoder(w).Encode(formattedHistory)
 	})))
 
 	// POST /api/deploy
@@ -295,6 +326,12 @@ func StartAPIGateway(store *kv.KVStore, raftNode *raft.BrainState, brainHost str
 				return
 			}
 			sub.UserScriptPath = sasURL
+			// BUGFIX: If they deploy a multi-shard Map-Reduce job via inline code, the
+			// GATHER logic is bundled in the same file. Mirror the script path so GATHER triggers.
+			// Gate on TotalMAPs > 1 so single-shard batch tasks don't spawn a rogue GATHER phase.
+			if sub.GatherScriptPath == "" && sub.TotalMAPs > 1 {
+				sub.GatherScriptPath = sasURL
+			}
 			sub.Code = ""      // Clear raw code to keep Raft log small
 			sub.Extension = "" // Clear extension
 		}

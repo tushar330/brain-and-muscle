@@ -467,7 +467,12 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 					entry := wal.LogEntry{Event: wal.EventTaskDispatched, TaskID: memTask.ID, WorkerID: msg.NodeID}
 					// Inject UploadURL for Memory Path tasks too!
 					uploadURL, _ := storage.GenerateWriteSAS(memTask.ID + ".json")
-					logUploadURL, _ := storage.GenerateWriteSAS("logs/" + memTask.ID + ".txt")
+					// Log blob is keyed by JobID so the frontend /api/logs/<jobID> resolves correctly
+					logJobID := p.JobID
+					if logJobID == "" {
+						logJobID = memTask.ID
+					}
+					logUploadURL, _ := storage.GenerateWriteSAS("logs/" + logJobID + ".txt")
 
 					walEngine.Enqueue(wal.WriteRequest{
 						Entry: entry, Conn: event.Conn, OpCode: protocol.OpTaskAssigned, RequestID: msg.RequestID,
@@ -506,6 +511,7 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 
 				// Generate Azure SAS Token for the Muscle
 				uploadURL, _ := storage.GenerateWriteSAS(dbTask.ID + ".json")
+				// Log blob keyed by JobID (= dbTask.ID for Postgres single-task jobs)
 				logUploadURL, _ := storage.GenerateWriteSAS("logs/" + dbTask.ID + ".txt")
 
 				reqCPU, _ := parsedPayload["required_cpu"].(float64)
@@ -621,6 +627,10 @@ func BrainProcessLoop(store *kv.KVStore, walEngine *wal.GroupCommitWAL, raftNode
 				submittedTask, taskFound := store.GetTask(envelope.TaskID)
 				if taskFound && submittedTask.JobID != "" {
 					if job, ok := store.GetJob(submittedTask.JobID); ok && job.Status == kv.JobCompleted {
+						//  BUGFIX: The overall job is complete, sync this terminal state to the postgres 'jobs' table!
+						// Without this, /api/history returns 'status: 1' (Running) forever on the frontend outside dashboard.
+						db.SyncJob(context.Background(), submittedTask.JobID, job.UserID, int(kv.JobCompleted), "", &dbBlobURL, job.JobType)
+
 						liveSiblings := store.GetJobLiveTasks(submittedTask.JobID)
 						if len(liveSiblings) > 0 {
 							log.Printf("[cleanup] 🧹 Job %s completed. Sweeping %d sibling tasks...", submittedTask.JobID, len(liveSiblings))

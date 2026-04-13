@@ -74,7 +74,7 @@ func GetJobsHistory(ctx context.Context, userID string, limit int) ([]DBJob, err
 	query := `
 		SELECT id, user_id, job_type, status, payload, result, created_at, completed_at 
 		FROM jobs 
-		WHERE user_id = $1
+		WHERE user_id = $1 OR $1 = '00000000-0000-0000-0000-000000000000'
 		ORDER BY created_at DESC 
 		LIMIT $2;
 	`

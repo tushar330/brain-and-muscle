@@ -328,8 +328,30 @@ func (kv *KVStore) PopBestFitTask(workerID string, availCPU float64, availRAM in
 		}
 
 		if cpu > availCPU || ram > availRAM {
+			//  NEW: Mark as failed if it's impossible to run on any online node
+			maxC, maxR := kv.getMaxWorkerCapacityInternal()
+			if cpu > maxC || ram > maxR {
+				errMsg := fmt.Sprintf("FAILED: Insufficient resources. Requested %.1f CPU / %d MB RAM exceeds maximum available node capacity (%.1f CPU / %d MB RAM)", cpu, ram, maxC, maxR)
+				log.Printf("[scheduler] ❌ Failing task %s: %s", t.ID, errMsg)
+
+				t.Status = StatusFailed
+				t.Result = errMsg
+				t.CompletedAt = time.Now()
+
+				// Sync Job status if applicable
+				if job, ok := kv.jobs[t.JobID]; ok {
+					job.Status = JobFailed
+					job.Result = errMsg
+					job.CompletedAt = time.Now()
+					payload, _ := json.Marshal(job)
+					db.SyncJob(context.Background(), t.JobID, job.UserID, int(JobFailed), string(payload), &errMsg, job.JobType)
+				}
+				// Remove from queue in next cleaner pass (cleanIDs)
+				continue
+			}
+
 			if time.Since(worker.LastLoggedSkip[t.ID]) > 1*time.Minute {
-				log.Printf("[scheduler] Skipping task %s for worker %s: Insufficient resources (%.1f/%.1f CPU, %d/%d MB RAM)", t.ID, workerID, cpu, availCPU, ram, availRAM)
+				log.Printf("[scheduler] Skipping task %s for worker %s: Temporary congestion (%.1f/%.1f CPU, %d/%d MB RAM)", t.ID, workerID, cpu, availCPU, ram, availRAM)
 				if worker.LastLoggedSkip == nil {
 					worker.LastLoggedSkip = make(map[string]time.Time)
 				}
@@ -452,7 +474,10 @@ func (kv *KVStore) GetAllNodes() []Worker {
 func (kv *KVStore) GetMaxWorkerCapacity() (maxCPU float64, maxRAM int) {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
+	return kv.getMaxWorkerCapacityInternal()
+}
 
+func (kv *KVStore) getMaxWorkerCapacityInternal() (maxCPU float64, maxRAM int) {
 	for _, w := range kv.workers {
 		// Only consider workers that have heartbeated in the last 60s
 		if time.Since(w.LastHeartbeat) > 60*time.Second {
@@ -652,6 +677,20 @@ func (kv *KVStore) CompleteTask(taskID, result string) {
 			job.Result = effectiveResult
 			job.CompletedAt = time.Now()
 			log.Printf("[job] %s fully completed (GATHER phase finished)", task.JobID)
+
+			//  SYNC TO DB: Persistence Ledger
+			payload, _ := json.Marshal(job)
+			db.SyncJob(context.Background(), task.JobID, job.UserID, int(JobCompleted), string(payload), &effectiveResult, job.JobType)
+		}
+	}
+
+	//  NEW: If this was a single MAP task (Batch Job), mark the parent Job as Completed!
+	if task.JobType == "MAP" && task.JobID != "" {
+		if job, ok := kv.jobs[task.JobID]; ok && job.TotalMAPs <= 1 {
+			job.Status = JobCompleted
+			job.Result = effectiveResult
+			job.CompletedAt = time.Now()
+			log.Printf("[job] %s fully completed (Batch MAP phase finished)", task.JobID)
 
 			//  SYNC TO DB: Persistence Ledger
 			payload, _ := json.Marshal(job)
