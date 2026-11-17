@@ -66,6 +66,9 @@ func FetchWork(brainURL string) (*WorkAssignment, *DBTask, error) {
 
 // CheckoutNextTask grabs the oldest pending task, marks it running, and returns it.
 func CheckoutNextTask(ctx context.Context, availCPU float64, availRAM int, workerID string) (*DBTask, error) {
+	if Pool == nil {
+		return nil, ErrNoTasksAvailable
+	}
 	// THE MAGIC QUERY: Now with Resource-Awareness and Worker Persistence!
 	// We use jsonb_set to inject the assigned_worker_id directly into the payload.
 	query := `
@@ -103,6 +106,9 @@ func CheckoutNextTask(ctx context.Context, availCPU float64, availRAM int, worke
 
 // CompleteTask marks a task as done and saves the Azure Blob URL
 func CompleteTask(ctx context.Context, taskID string, blobURL string) error {
+	if Pool == nil {
+		return nil
+	}
 	//  FIX: Sanitize ID for Postgres (Strip Map-Reduce suffixes like -map-0 or -gather)
 	cleanID := taskID
 	if idx := strings.Index(cleanID, "-map-"); idx != -1 {
@@ -159,6 +165,9 @@ func CompleteTask(ctx context.Context, taskID string, blobURL string) error {
 
 // FailTask allows a Muscle to report that a job completely crashed
 func FailTask(ctx context.Context, taskID string, errorMsg string) error {
+	if Pool == nil {
+		return nil
+	}
 	// We can append the error message into the JSON payload, or just mark it failed
 	query := `
 		UPDATE tasks 

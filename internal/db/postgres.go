@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -42,6 +43,9 @@ func InitDB() error {
 
 // SyncJob upserts the overarching Job state into Postgres
 func SyncJob(ctx context.Context, jobID, userID string, status int, payload string, result *string, jobType string) error {
+	if Pool == nil {
+		return nil
+	}
 	//  MIGRATION FIX: Default empty identity to System
 	safeUserID := userID
 	if safeUserID == "" {
@@ -71,6 +75,9 @@ func SyncJob(ctx context.Context, jobID, userID string, status int, payload stri
 
 // GetJobsHistory retrieves the most recent jobs for a user (excluding active services usually)
 func GetJobsHistory(ctx context.Context, userID string, limit int) ([]DBJob, error) {
+	if Pool == nil {
+		return []DBJob{}, nil
+	}
 	query := `
 		SELECT id, user_id, job_type, status, payload, result, created_at, completed_at 
 		FROM jobs 
@@ -98,6 +105,9 @@ func GetJobsHistory(ctx context.Context, userID string, limit int) ([]DBJob, err
 
 // CreateTask pushes a new job into the queue with optional project/git metadata
 func CreateTask(ctx context.Context, userID string, payload []byte, projectID *string, commitHash *string, branchName *string, jobType string, cpu float64, ram int) (string, error) {
+	if Pool == nil {
+		return uuid.New().String(), nil
+	}
 	var taskID string
 
 	//  ENHANCEMENT: Inject metadata into the JSON payload before saving
@@ -135,6 +145,9 @@ func CreateTask(ctx context.Context, userID string, payload []byte, projectID *s
 
 // GetTaskByID retrieves a single task record by its UUID
 func GetTaskByID(ctx context.Context, id string) (*DBTask, error) {
+	if Pool == nil {
+		return nil, fmt.Errorf("database not connected")
+	}
 	query := `SELECT id, payload, result_blob_url FROM tasks WHERE id = $1`
 	var task DBTask
 	err := Pool.QueryRow(ctx, query, id).Scan(&task.ID, &task.Payload, &task.ResultBlobURL)
@@ -146,6 +159,9 @@ func GetTaskByID(ctx context.Context, id string) (*DBTask, error) {
 
 // UpdateTaskResult persistently saves the final ArchiveURL (logs/results) to Postgres
 func UpdateTaskResult(ctx context.Context, id string, archiveURL string) error {
+	if Pool == nil {
+		return nil
+	}
 	// 1. Get current payload
 	task, err := GetTaskByID(ctx, id)
 	if err != nil {

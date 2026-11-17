@@ -89,7 +89,7 @@ func main() {
 	// 4. Initialize Database (Supabase/Postgres) & Memory Store
 	store := kv.NewKVStore()
 	if err := db.InitDB(); err != nil {
-		log.Fatalf("[boot] Failed to initialize database: %v", err)
+		log.Printf("[boot] Notice: Database not connected (%v). Running in In-Memory / Raft standalone mode", err)
 	}
 
 	// 5. Initialize Lock-Free Store and Group Commit WAL
