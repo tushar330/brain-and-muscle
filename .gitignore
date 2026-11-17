@@ -54,3 +54,9 @@ train.py
 distributed_ml.py
 
 *.pem
+# Compiled brain/muscle binaries (never commit build outputs)
+brain-linux*
+muscle-linux*
+muscle-macos*
+bam-brain
+bam-muscle*
